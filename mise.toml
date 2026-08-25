@@ -1,0 +1,10 @@
+[tools]
+rust = "1.97.1"
+
+[tasks.check]
+description = "Run all local quality gates"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  "cargo test --workspace --all-features",
+]

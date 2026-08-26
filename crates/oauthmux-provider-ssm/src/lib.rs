@@ -182,6 +182,8 @@ struct RawInstance {
     #[serde(default)]
     scopes: Vec<String>,
     #[serde(default)]
+    allowed_scopes: Option<Vec<String>>,
+    #[serde(default)]
     allowed_redirect_origins: Vec<String>,
     #[serde(default)]
     default_redirect_uri: Option<String>,
@@ -253,6 +255,7 @@ pub fn parse_instance(name: &str, document: &str) -> anyhow::Result<Instance> {
             client_id: raw.client_id,
             client_secret: SecretString::new(raw.client_secret),
             scopes: raw.scopes,
+            allowed_scopes: raw.allowed_scopes,
         },
         client_auth,
         allowed_redirect_origins,
@@ -304,6 +307,7 @@ token_endpoint: https://issuer.example/token
 client_id: upstream
 client_secret: secret
 scopes: [openid]
+allowed_scopes: [openid, email]
 allowed_redirect_origins: [https://app.example]
 default_redirect_uri: https://app.example/callback
 client_auth:
@@ -340,6 +344,11 @@ client_auth:
             SsmProvider::new(client, "/oauthmux/instances/", Duration::from_secs(60)).unwrap();
         let snapshot = provider.load().await.unwrap();
         assert_eq!(snapshot.instances.len(), 2);
+        assert!(snapshot.instances.values().all(|instance| instance
+            .upstream
+            .allowed_scopes
+            .as_ref()
+            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "email"))));
     }
 
     #[test]

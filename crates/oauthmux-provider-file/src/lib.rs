@@ -111,6 +111,8 @@ pub struct RawInstance {
     #[serde(default)]
     scopes: Vec<String>,
     #[serde(default)]
+    allowed_scopes: Option<Vec<String>>,
+    #[serde(default)]
     allowed_redirect_origins: Vec<String>,
     #[serde(default)]
     default_redirect_uri: Option<String>,
@@ -212,6 +214,7 @@ impl RawInstance {
                 client_id: self.client_id,
                 client_secret: SecretString::new(secret),
                 scopes: self.scopes,
+                allowed_scopes: self.allowed_scopes,
             },
             client_auth,
             allowed_redirect_origins,
@@ -272,6 +275,35 @@ instances:
         assert!(snapshot
             .instances
             .contains_key(&InstanceKey::new("google").unwrap()));
+    }
+
+    #[test]
+    fn scope_allowlist_contains_every_default_scope() {
+        let valid = VALID.replace(
+            "    scopes: [openid]",
+            "    scopes: [openid]\n    allowed_scopes: [openid, email]",
+        );
+        let snapshot = parse_config(&valid, |_| unreachable!()).unwrap();
+        assert_eq!(
+            snapshot
+                .instances
+                .values()
+                .next()
+                .unwrap()
+                .upstream
+                .allowed_scopes
+                .as_deref(),
+            Some(["openid".into(), "email".into()].as_slice())
+        );
+        let invalid = VALID.replace(
+            "    scopes: [openid]",
+            "    scopes: [openid, email]\n    allowed_scopes: [openid]",
+        );
+        assert!(format!(
+            "{:#}",
+            parse_config(&invalid, |_| unreachable!()).unwrap_err()
+        )
+        .contains("allowed_scopes"));
     }
 
     #[test]

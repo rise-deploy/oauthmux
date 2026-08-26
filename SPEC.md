@@ -117,6 +117,8 @@ pub struct UpstreamSpec {
     pub client_id: String,
     pub client_secret: SecretString,   // resolved by the provider (§6)
     pub scopes: Vec<String>,
+    /// Optional restriction for requested and configured default scopes.
+    pub allowed_scopes: Option<Vec<String>>,
 }
 
 /// How the *application* authenticates to this proxy's /token endpoint.
@@ -201,9 +203,9 @@ All under the mounted prefix, per instance key `K` (shown single-segment):
 
 | Route | Behavior |
 | --- | --- |
-| `GET /oidc/{K}/authorize` | Params: `redirect_uri?` (validated against allow-list + loopback; falls back to `default_redirect_uri`), `state?` (passed through), `code_challenge?` + `code_challenge_method?` (`S256` only; required for `Public` clients). Seals flow state (§5) into the upstream `state` param, generates the *upstream* PKCE verifier, 302 → upstream authorization endpoint with the instance's upstream `client_id`, scopes, and `redirect_uri = {public_url}/oidc/{K}/callback`. |
-| `GET /oidc/{K}/callback` | Params `code`, `state`. Unseals + validates state (TTL 10 min, instance key match). Exchanges the upstream code at the upstream token endpoint (with upstream client secret + upstream PKCE verifier). Seals the raw upstream token response (body, content-type, status) into an authorization-code envelope (§5). 302 → the app's redirect target with `code=<envelope>&state=<app state>`. Upstream errors (`error` param) are relayed to the app redirect target as `error`/`error_description`. |
-| `POST /oidc/{K}/token` | Form-encoded, RFC 6749. `grant_type=authorization_code`: authenticate the client per the instance's `ClientAuth` (PKCE verifier against the sealed challenge, client secret, or JWT assertion), check TTL (5 min) and replay cache if configured, unseal and return the stored upstream token response verbatim. `grant_type=refresh_token`: authenticate the client, proxy the refresh to the upstream token endpoint with upstream credentials, relay the response. CORS: reflect allowed origins from the instance allow-list; support preflight `OPTIONS`. |
+| `GET /oidc/{K}/authorize` | Validates the application redirect and downstream PKCE, seals application state, and generates independent upstream state and PKCE. oauthmux replaces `client_id`, `redirect_uri`, `state`, `code_challenge`, and `code_challenge_method`; constrains the flow to authorization code with query response mode; and forwards the remaining query pairs. A supplied `scope` is preserved subject to `allowed_scopes`; configured `scopes` is the fallback. OIDC request objects are rejected. |
+| `GET /oidc/{K}/callback` | Unseals and validates state (TTL 10 min, instance key match), exchanges the upstream code with the upstream credentials and PKCE verifier, and seals the raw token response into the application code. The application receives its original state and all non-owned upstream response parameters. |
+| `POST /oidc/{K}/token` | Form-encoded, RFC 6749. `authorization_code` authenticates the application, validates TTL/replay/redirect/PKCE, and returns the stored upstream response verbatim. `refresh_token` authenticates the application, preserves grant extensions, replaces downstream client authentication with upstream credentials, and relays the upstream response. CORS reflects allowed origins and supports preflight `OPTIONS`. |
 | `GET /oidc/{K}/.well-known/openid-configuration` | Fetch upstream discovery (if OIDC), rewrite `issuer`, `authorization_endpoint`, `token_endpoint`, `jwks_uri` to `{public_url}/oidc/{K}/…`. For non-OIDC instances, synthesize a minimal document from the configured endpoints. |
 | `GET /oidc/{K}/jwks` | Proxy upstream JWKS (cache ~10 min). 404 for instances with no JWKS. |
 | `GET /healthz` | Liveness (binary only, not part of the embeddable router). |
@@ -334,14 +336,14 @@ Multi-stage build to a single static binary:
   tamper rejection; redirect-origin validation incl. loopback and open-redirect attempts; PKCE
   S256 verification; client-secret constant-time auth; provider YAML parsing incl. every
   validation error path; snapshot merge + collision rule.
-- **Integration (in CI, no network):** an in-process mock upstream IdP (an Axum app serving
-  `.well-known/openid-configuration`, `authorize` that immediately 302s back with a code,
-  `token`, `jwks`). Full-flow tests through the real router: (a) public client with PKCE,
-  (b) confidential client with client_secret, (c) refresh grant, (d) expired/replayed code,
-  (e) invalid redirect_uri, (f) discovery rewrite correctness, (g) TwoSegment embedding via the
-  doc-test example's setup.
-- **CI:** fmt check, clippy `-D warnings`, tests, Docker build. All green before any milestone
-  is called done.
+- **Integration (in CI, no external services):** an in-process signed OIDC fixture exercises
+  public and confidential clients, request relay, scope policy, refresh, nonce and ID-token trust,
+  replay, redirect validation, discovery, and two-segment embedding. Google and Cognito behavior
+  is expressed as small profiles over the generic fixture.
+- **End to end:** a pinned Dex container and the standalone oauthmux process run the complete
+  authorization-code, ID-token validation, refresh, replay, and redirect-policy flow through
+  `mise run e2e`.
+- **CI:** fmt check, clippy `-D warnings`, in-process tests, Dex E2E, and Docker build.
 
 ## 10. Milestones
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{fmt, str::FromStr, sync::Arc};
+use std::{collections::HashSet, fmt, str::FromStr, sync::Arc};
 use url::Url;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -114,6 +114,7 @@ pub struct UpstreamSpec {
     pub client_id: String,
     pub client_secret: SecretString,
     pub scopes: Vec<String>,
+    pub allowed_scopes: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -187,6 +188,31 @@ impl Instance {
         if self.upstream.client_secret.expose().is_empty() {
             return Err("upstream.client_secret must not be empty".into());
         }
+        let mut configured_scopes = HashSet::new();
+        for scope in &self.upstream.scopes {
+            if !valid_scope_token(scope) {
+                return Err("upstream.scopes must contain valid RFC 6749 scope tokens".into());
+            }
+            if !configured_scopes.insert(scope.as_str()) {
+                return Err("upstream.scopes must not contain duplicates".into());
+            }
+        }
+        if let Some(allowed) = &self.upstream.allowed_scopes {
+            let mut allowed_scopes = HashSet::new();
+            for scope in allowed {
+                if !valid_scope_token(scope) {
+                    return Err(
+                        "upstream.allowed_scopes must contain valid RFC 6749 scope tokens".into(),
+                    );
+                }
+                if !allowed_scopes.insert(scope.as_str()) {
+                    return Err("upstream.allowed_scopes must not contain duplicates".into());
+                }
+            }
+            if !configured_scopes.is_subset(&allowed_scopes) {
+                return Err("upstream.scopes must be contained in upstream.allowed_scopes".into());
+            }
+        }
         if let Some(default) = &self.default_redirect_uri {
             if !self.redirect_allowed(default) {
                 return Err("default_redirect_uri origin is not allowed".into());
@@ -223,6 +249,13 @@ impl Instance {
     }
 }
 
+pub(crate) fn valid_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|byte| matches!(byte, 0x21 | 0x23..=0x5b | 0x5d..=0x7e))
+}
+
 pub(crate) fn same_origin(a: &Url, b: &Url) -> bool {
     a.scheme() == b.scheme()
         && a.host_str()
@@ -251,6 +284,7 @@ mod tests {
                 client_id: "id".into(),
                 client_secret: SecretString::new("secret"),
                 scopes: vec![],
+                allowed_scopes: None,
             },
             client_auth: ClientAuth::Public,
             allowed_redirect_origins: vec![origin],

@@ -1,8 +1,11 @@
-use crate::{ClientAuth, ClientJwks, Instance, InstanceKey, InstanceResolver, ReplayCache, Sealer};
+use crate::{
+    model::valid_scope_token, ClientAuth, ClientJwks, Instance, InstanceKey, InstanceResolver,
+    ReplayCache, Sealer,
+};
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
+    extract::{Path, State},
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::any,
     Json, Router,
@@ -82,23 +85,22 @@ struct StoredResponse {
     body: Vec<u8>,
 }
 
-#[derive(Deserialize)]
-struct AuthorizeQuery {
+struct AuthorizeRequest {
     redirect_uri: Option<String>,
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
+    scope: Option<String>,
+    forwarded: Vec<(String, String)>,
 }
 
-#[derive(Deserialize)]
-struct CallbackQuery {
+struct CallbackRequest {
     code: Option<String>,
     state: String,
-    error: Option<String>,
-    error_description: Option<String>,
+    error: bool,
+    forwarded: Vec<(String, String)>,
 }
 
-#[derive(Deserialize, Default)]
 struct TokenRequest {
     grant_type: String,
     code: Option<String>,
@@ -107,8 +109,10 @@ struct TokenRequest {
     client_id: Option<String>,
     client_secret: Option<String>,
     code_verifier: Option<String>,
+    scope: Option<String>,
     client_assertion_type: Option<String>,
     client_assertion: Option<String>,
+    pairs: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy)]
@@ -169,15 +173,15 @@ async fn dispatch(
     let method = request.method().clone();
     match (endpoint, method) {
         (Endpoint::Authorize, Method::GET) => {
-            let query = match Query::<AuthorizeQuery>::try_from_uri(request.uri()) {
-                Ok(Query(query)) => query,
+            let query = match parse_authorize_request(request.uri()) {
+                Ok(query) => query,
                 Err(_) => return StatusCode::BAD_REQUEST.into_response(),
             };
             authorize(&state, &instance, query).await
         }
         (Endpoint::Callback, Method::GET) => {
-            let query = match Query::<CallbackQuery>::try_from_uri(request.uri()) {
-                Ok(Query(query)) => query,
+            let query = match parse_callback_request(request.uri()) {
+                Ok(query) => query,
                 Err(_) => return StatusCode::BAD_REQUEST.into_response(),
             };
             callback(&state, &instance, query).await
@@ -218,7 +222,165 @@ fn parse_path(path: &str, strategy: &KeyStrategy) -> Option<(InstanceKey, Endpoi
     Some((key, endpoint))
 }
 
-async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeQuery) -> Response {
+fn query_pairs(uri: &Uri) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+        .into_owned()
+        .collect()
+}
+
+fn parse_authorize_request(uri: &Uri) -> Result<AuthorizeRequest, ()> {
+    let mut redirect_uri = None;
+    let mut state = None;
+    let mut code_challenge = None;
+    let mut code_challenge_method = None;
+    let mut scope = None;
+    let mut forwarded = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (name, value) in query_pairs(uri) {
+        let singleton = matches!(
+            name.as_str(),
+            "redirect_uri"
+                | "state"
+                | "client_id"
+                | "response_type"
+                | "response_mode"
+                | "code_challenge"
+                | "code_challenge_method"
+                | "scope"
+                | "nonce"
+                | "prompt"
+                | "login_hint"
+                | "request"
+                | "request_uri"
+        );
+        if singleton && !seen.insert(name.clone()) {
+            return Err(());
+        }
+        match name.as_str() {
+            "redirect_uri" => redirect_uri = Some(value),
+            "state" => state = Some(value),
+            "client_id" => {}
+            "response_type" if value == "code" => {}
+            "response_type" => return Err(()),
+            "response_mode" if value == "query" => forwarded.push((name, value)),
+            "response_mode" => return Err(()),
+            "code_challenge" => code_challenge = Some(value),
+            "code_challenge_method" => code_challenge_method = Some(value),
+            "scope" => scope = Some(value),
+            "request" | "request_uri" => return Err(()),
+            _ => forwarded.push((name, value)),
+        }
+    }
+
+    Ok(AuthorizeRequest {
+        redirect_uri,
+        state,
+        code_challenge,
+        code_challenge_method,
+        scope,
+        forwarded,
+    })
+}
+
+fn parse_callback_request(uri: &Uri) -> Result<CallbackRequest, ()> {
+    let mut code = None;
+    let mut state = None;
+    let mut error = false;
+    let mut forwarded = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for (name, value) in query_pairs(uri) {
+        if matches!(name.as_str(), "code" | "state" | "error") && !seen.insert(name.clone()) {
+            return Err(());
+        }
+        match name.as_str() {
+            "code" => code = Some(value),
+            "state" => state = Some(value),
+            "error" => {
+                error = true;
+                forwarded.push((name, value));
+            }
+            _ => forwarded.push((name, value)),
+        }
+    }
+    if code.is_some() == error {
+        return Err(());
+    }
+    Ok(CallbackRequest {
+        code,
+        state: state.ok_or(())?,
+        error,
+        forwarded,
+    })
+}
+
+fn scope_allowed(instance: &Instance, scope: &str) -> bool {
+    let scopes: Vec<_> = scope.split(' ').collect();
+    if scopes.is_empty() || scopes.iter().any(|scope| !valid_scope_token(scope)) {
+        return false;
+    }
+    instance
+        .upstream
+        .allowed_scopes
+        .as_ref()
+        .is_none_or(|allowed| {
+            scopes
+                .iter()
+                .all(|scope| allowed.iter().any(|candidate| candidate == scope))
+        })
+}
+
+fn parse_token_request(body: &[u8]) -> Result<TokenRequest, ()> {
+    let pairs: Vec<(String, String)> = url::form_urlencoded::parse(body).into_owned().collect();
+    let mut grant_type = None;
+    let mut code = None;
+    let mut refresh_token = None;
+    let mut redirect_uri = None;
+    let mut client_id = None;
+    let mut client_secret = None;
+    let mut code_verifier = None;
+    let mut scope = None;
+    let mut client_assertion_type = None;
+    let mut client_assertion = None;
+    let mut seen = std::collections::HashSet::new();
+
+    for (name, value) in &pairs {
+        let target = match name.as_str() {
+            "grant_type" => &mut grant_type,
+            "code" => &mut code,
+            "refresh_token" => &mut refresh_token,
+            "redirect_uri" => &mut redirect_uri,
+            "client_id" => &mut client_id,
+            "client_secret" => &mut client_secret,
+            "code_verifier" => &mut code_verifier,
+            "scope" => &mut scope,
+            "client_assertion_type" => &mut client_assertion_type,
+            "client_assertion" => &mut client_assertion,
+            _ => continue,
+        };
+        if !seen.insert(name.as_str()) {
+            return Err(());
+        }
+        *target = Some(value.clone());
+    }
+
+    Ok(TokenRequest {
+        grant_type: grant_type.ok_or(())?,
+        code,
+        refresh_token,
+        redirect_uri,
+        client_id,
+        client_secret,
+        code_verifier,
+        scope,
+        client_assertion_type,
+        client_assertion,
+        pairs,
+    })
+}
+
+async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeRequest) -> Response {
     let redirect = match query.redirect_uri {
         Some(value) => match Url::parse(&value) {
             Ok(url) if instance.redirect_allowed(&url) => url,
@@ -236,6 +398,9 @@ async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeQuery)
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if query.code_challenge.is_none() && query.code_challenge_method.is_some() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if matches!(instance.client_auth, ClientAuth::Public) && query.code_challenge.is_none() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -246,6 +411,12 @@ async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeQuery)
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let scope = match query.scope {
+        Some(scope) if scope_allowed(instance, &scope) => Some(scope),
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
+        None if instance.upstream.scopes.is_empty() => None,
+        None => Some(instance.upstream.scopes.join(" ")),
+    };
     let endpoints = match resolve_endpoints(state, instance).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
@@ -273,15 +444,18 @@ async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeQuery)
             .append_pair("response_type", "code")
             .append_pair("client_id", &instance.upstream.client_id)
             .append_pair("redirect_uri", callback.as_str())
-            .append_pair("scope", &instance.upstream.scopes.join(" "))
             .append_pair("state", &sealed)
             .append_pair("code_challenge", &pkce_challenge(&verifier))
             .append_pair("code_challenge_method", "S256");
+        if let Some(scope) = scope {
+            params.append_pair("scope", &scope);
+        }
+        params.extend_pairs(query.forwarded);
     }
     found(upstream.as_str())
 }
 
-async fn callback(state: &AppState, instance: &Instance, query: CallbackQuery) -> Response {
+async fn callback(state: &AppState, instance: &Instance, query: CallbackRequest) -> Response {
     let flow = match unseal_postcard::<FlowEnvelope>(state, instance, &query.state) {
         Ok(value)
             if value.instance_key == instance.key.as_str() && fresh(value.issued_at, FLOW_TTL) =>
@@ -294,13 +468,8 @@ async fn callback(state: &AppState, instance: &Instance, query: CallbackQuery) -
         Ok(url) if instance.redirect_allowed(&url) => url,
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
-    if let Some(error) = query.error {
-        redirect.query_pairs_mut().append_pair("error", &error);
-        if let Some(description) = query.error_description {
-            redirect
-                .query_pairs_mut()
-                .append_pair("error_description", &description);
-        }
+    if query.error {
+        redirect.query_pairs_mut().extend_pairs(query.forwarded);
         if let Some(app_state) = flow.app_state {
             redirect.query_pairs_mut().append_pair("state", &app_state);
         }
@@ -362,6 +531,7 @@ async fn callback(state: &AppState, instance: &Instance, query: CallbackQuery) -
         tracing::warn!(instance = %instance.key, size = sealed.len(), "sealed authorization code may exceed URL limits");
     }
     redirect.query_pairs_mut().append_pair("code", &sealed);
+    redirect.query_pairs_mut().extend_pairs(query.forwarded);
     if let Some(app_state) = flow.app_state {
         redirect.query_pairs_mut().append_pair("state", &app_state);
     }
@@ -379,7 +549,7 @@ async fn token(state: &AppState, instance: &Instance, request: Request<Body>) ->
             )
         }
     };
-    let form: TokenRequest = match serde_urlencoded::from_bytes(&bytes) {
+    let form = match parse_token_request(&bytes) {
         Ok(form) => form,
         Err(_) => {
             return with_cors(
@@ -494,27 +664,49 @@ async fn exchange_sealed_code(
 }
 
 async fn refresh(state: &AppState, instance: &Instance, form: &TokenRequest) -> Response {
-    let Some(refresh_token) = &form.refresh_token else {
+    if form.refresh_token.is_none() {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "refresh_token is required",
         );
-    };
+    }
+    if form
+        .scope
+        .as_deref()
+        .is_some_and(|scope| !scope_allowed(instance, scope))
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "scope is not allowed",
+        );
+    }
     let endpoints = match resolve_endpoints(state, instance).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
+    let mut upstream_form: Vec<_> = form
+        .pairs
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "client_id" | "client_secret" | "client_assertion_type" | "client_assertion"
+            )
+        })
+        .cloned()
+        .collect();
+    upstream_form.push(("client_id".into(), instance.upstream.client_id.clone()));
+    upstream_form.push((
+        "client_secret".into(),
+        instance.upstream.client_secret.expose().to_owned(),
+    ));
     match state
         .cfg
         .http
         .post(endpoints.token_endpoint)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
-            ("client_id", instance.upstream.client_id.as_str()),
-            ("client_secret", instance.upstream.client_secret.expose()),
-        ])
+        .form(&upstream_form)
         .send()
         .await
     {

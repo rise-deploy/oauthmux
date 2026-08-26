@@ -4,23 +4,36 @@ use crate::{
 };
 use axum::{
     body::Body,
-    extract::{Query, State},
-    http::Request,
+    extract::State,
+    http::{Request, Uri},
     routing::{get, post},
 };
 use http_body_util::BodyExt;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{
+    decode, decode_header, encode, jwk::JwkSet, Algorithm, DecodingKey, EncodingKey, Header,
+    Validation,
+};
 use rsa::{
     pkcs8::{EncodePrivateKey, LineEnding},
     traits::PublicKeyParts,
     RsaPrivateKey,
 };
-use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
 use tower::ServiceExt;
+
+type FormPairs = Vec<(String, String)>;
+type RequestCapture = Arc<StdMutex<Vec<FormPairs>>>;
 
 #[derive(Clone)]
 struct MockIdpState {
     base: Url,
+    capture: MockCapture,
+}
+
+#[derive(Clone, Default)]
+struct MockCapture {
+    authorize: RequestCapture,
+    token: RequestCapture,
 }
 
 async fn mock_discovery(State(state): State<MockIdpState>) -> Json<Value> {
@@ -33,16 +46,36 @@ async fn mock_discovery(State(state): State<MockIdpState>) -> Json<Value> {
     }))
 }
 
-async fn mock_authorize(Query(query): Query<HashMap<String, String>>) -> Response {
-    let mut callback = Url::parse(query.get("redirect_uri").unwrap()).unwrap();
+async fn mock_authorize(State(state): State<MockIdpState>, uri: Uri) -> Response {
+    let query: Vec<(String, String)> =
+        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+    state.capture.authorize.lock().unwrap().push(query.clone());
+    let value = |name: &str| {
+        query
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap()
+            .1
+            .as_str()
+    };
+    let mut callback = Url::parse(value("redirect_uri")).unwrap();
     callback
         .query_pairs_mut()
         .append_pair("code", "upstream-code")
-        .append_pair("state", query.get("state").unwrap());
+        .append_pair("state", value("state"))
+        .append_pair("iss", state.base.as_str())
+        .append_pair("session_state", "upstream-session");
     found(callback.as_str())
 }
 
-async fn mock_token(body: String) -> Response {
+async fn mock_token(State(state): State<MockIdpState>, body: String) -> Response {
+    state.capture.token.lock().unwrap().push(
+        url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect(),
+    );
     if body.contains("grant_type=refresh_token") {
         return Response::builder()
             .status(StatusCode::ACCEPTED)
@@ -65,20 +98,261 @@ async fn mock_jwks() -> Json<Value> {
     Json(json!({ "keys": [] }))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayProfile {
+    Google,
+    Cognito,
+}
+
+#[derive(Clone)]
+struct SignedFixtureState {
+    base: Url,
+    issuer: String,
+    private_pem: Arc<String>,
+    jwks: Value,
+    nonce: Arc<StdMutex<Option<String>>>,
+    authorize: Arc<StdMutex<Vec<(String, String)>>>,
+}
+
+async fn signed_discovery(State(state): State<SignedFixtureState>) -> Json<Value> {
+    Json(json!({
+        "issuer": state.issuer,
+        "authorization_endpoint": state.base.join("authorize").unwrap(),
+        "token_endpoint": state.base.join("token").unwrap(),
+        "jwks_uri": state.base.join("jwks").unwrap(),
+        "userinfo_endpoint": state.base.join("userinfo").unwrap(),
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"]
+    }))
+}
+
+async fn signed_authorize(State(state): State<SignedFixtureState>, uri: Uri) -> Response {
+    let query: Vec<(String, String)> =
+        url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
+            .into_owned()
+            .collect();
+    *state.authorize.lock().unwrap() = query.clone();
+    *state.nonce.lock().unwrap() = query
+        .iter()
+        .find(|(name, _)| name == "nonce")
+        .map(|(_, value)| value.clone());
+    let value = |name: &str| {
+        query
+            .iter()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap()
+            .1
+            .as_str()
+    };
+    let mut callback = Url::parse(value("redirect_uri")).unwrap();
+    callback
+        .query_pairs_mut()
+        .append_pair("code", "signed-fixture-code")
+        .append_pair("state", value("state"))
+        .append_pair("iss", &state.issuer);
+    found(callback.as_str())
+}
+
+async fn signed_token(State(state): State<SignedFixtureState>, body: String) -> Response {
+    let form: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+        .into_owned()
+        .collect();
+    if form
+        .iter()
+        .any(|pair| pair == &("grant_type".into(), "refresh_token".into()))
+    {
+        return Json(json!({
+            "access_token": "fixture-refreshed-access-token",
+            "expires_in": 3600,
+            "scope": "openid email profile",
+            "token_type": "Bearer"
+        }))
+        .into_response();
+    }
+
+    let access_token = "fixture-access-token";
+    let at_hash = URL_SAFE_NO_PAD.encode(&Sha256::digest(access_token.as_bytes())[..16]);
+    let mut claims = json!({
+        "iss": state.issuer,
+        "sub": "fixture-subject",
+        "aud": "upstream-client",
+        "azp": "upstream-client",
+        "iat": unix_now(),
+        "exp": unix_now() + 3600,
+        "nonce": state.nonce.lock().unwrap().clone().unwrap(),
+        "at_hash": at_hash,
+        "email": "person@example.com",
+        "email_verified": true,
+        "name": "Fixture Person",
+        "picture": "https://images.example/person.png"
+    });
+    if state.issuer == "https://accounts.google.com" {
+        claims["hd"] = Value::String("example.com".into());
+    }
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("fixture-signing-key".into());
+    let id_token = encode(
+        &header,
+        &claims,
+        &EncodingKey::from_rsa_pem(state.private_pem.as_bytes()).unwrap(),
+    )
+    .unwrap();
+    Json(json!({
+        "access_token": access_token,
+        "expires_in": 3600,
+        "scope": "openid email profile",
+        "token_type": "Bearer",
+        "id_token": id_token,
+        "refresh_token": "fixture-refresh-token"
+    }))
+    .into_response()
+}
+
+async fn signed_jwks(State(state): State<SignedFixtureState>) -> Json<Value> {
+    Json(state.jwks)
+}
+
+async fn signed_userinfo(headers: HeaderMap) -> Response {
+    if headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        != Some("Bearer fixture-access-token")
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(json!({
+        "sub": "fixture-subject",
+        "email": "person@example.com",
+        "email_verified": true,
+        "name": "Fixture Person"
+    }))
+    .into_response()
+}
+
+async fn setup_signed_profile(
+    profile: RelayProfile,
+) -> (
+    Router,
+    SignedFixtureState,
+    tokio::task::JoinHandle<()>,
+    String,
+    ClientAuth,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+    let issuer = match profile {
+        RelayProfile::Google => "https://accounts.google.com".into(),
+        RelayProfile::Cognito => base.to_string().trim_end_matches('/').into(),
+    };
+    let private = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).unwrap();
+    let jwks = json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": "fixture-signing-key",
+            "alg": "RS256",
+            "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(private.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(private.e().to_bytes_be())
+        }]
+    });
+    let private_pem = private.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+    let fixture = SignedFixtureState {
+        base: base.clone(),
+        issuer,
+        private_pem: Arc::new(private_pem),
+        jwks,
+        nonce: Arc::new(StdMutex::new(None)),
+        authorize: Arc::new(StdMutex::new(Vec::new())),
+    };
+    let idp = Router::new()
+        .route("/.well-known/openid-configuration", get(signed_discovery))
+        .route("/authorize", get(signed_authorize))
+        .route("/token", post(signed_token))
+        .route("/jwks", get(signed_jwks))
+        .route("/userinfo", get(signed_userinfo))
+        .with_state(fixture.clone());
+    let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
+    let (redirect_origin, redirect_uri, client_auth) = match profile {
+        RelayProfile::Google => (
+            "https://app.example",
+            "https://app.example/callback",
+            ClientAuth::Public,
+        ),
+        RelayProfile::Cognito => (
+            "https://cognito.example",
+            "https://cognito.example/oauth2/idpresponse",
+            ClientAuth::ClientSecret {
+                client_id: "upstream-client".into(),
+                client_secret: SecretString::new("upstream-secret"),
+            },
+        ),
+    };
+    let key = InstanceKey::new("profile").unwrap();
+    let instance = Arc::new(Instance {
+        key: key.clone(),
+        upstream: UpstreamSpec {
+            issuer_url: base,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            jwks_uri: None,
+            client_id: "upstream-client".into(),
+            client_secret: SecretString::new("upstream-secret"),
+            scopes: vec!["openid".into(), "email".into(), "profile".into()],
+            allowed_scopes: Some(vec!["openid".into(), "email".into(), "profile".into()]),
+        },
+        client_auth: client_auth.clone(),
+        allowed_redirect_origins: vec![Origin::parse(redirect_origin).unwrap()],
+        default_redirect_uri: Some(Url::parse(redirect_uri).unwrap()),
+    });
+    let mut instances = InstanceMap::new();
+    instances.insert(key, instance);
+    let app = router(
+        Arc::new(instances),
+        MuxConfig {
+            public_url: Url::parse("https://mux.example/").unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[8_u8; 32], None).unwrap()),
+            replay_cache: Some(Arc::new(MemoryReplayCache::default())),
+            http: reqwest::Client::new(),
+        },
+        KeyStrategy::SingleSegment,
+    );
+    (app, fixture, task, redirect_uri.into(), client_auth)
+}
+
 async fn setup(
     key: &str,
     auth: ClientAuth,
     strategy: KeyStrategy,
 ) -> (Router, Arc<XChaChaSealer>, tokio::task::JoinHandle<()>) {
+    let (app, sealer, task, _) = setup_with_capture(key, auth, strategy, None).await;
+    (app, sealer, task)
+}
+
+async fn setup_with_capture(
+    key: &str,
+    auth: ClientAuth,
+    strategy: KeyStrategy,
+    allowed_scopes: Option<Vec<String>>,
+) -> (
+    Router,
+    Arc<XChaChaSealer>,
+    tokio::task::JoinHandle<()>,
+    MockCapture,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let base = Url::parse(&format!("http://{address}/")).unwrap();
+    let capture = MockCapture::default();
     let idp = Router::new()
         .route("/.well-known/openid-configuration", get(mock_discovery))
         .route("/authorize", get(mock_authorize))
         .route("/token", post(mock_token))
         .route("/jwks", get(mock_jwks))
-        .with_state(MockIdpState { base: base.clone() });
+        .with_state(MockIdpState {
+            base: base.clone(),
+            capture: capture.clone(),
+        });
     let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
 
     let key = InstanceKey::new(key).unwrap();
@@ -92,6 +366,7 @@ async fn setup(
             client_id: "upstream-client".into(),
             client_secret: SecretString::new("upstream-secret"),
             scopes: vec!["openid".into(), "email".into()],
+            allowed_scopes,
         },
         client_auth: auth,
         allowed_redirect_origins: vec![Origin::parse("https://app.example").unwrap()],
@@ -110,7 +385,7 @@ async fn setup(
         },
         strategy,
     );
-    (app, sealer, task)
+    (app, sealer, task, capture)
 }
 
 async fn response_body(response: Response) -> Vec<u8> {
@@ -167,6 +442,10 @@ async fn authorization_code(app: &Router, path_key: &str, challenge: Option<&str
             .1,
         "app-state"
     );
+    assert!(app_redirect
+        .query_pairs()
+        .any(|(name, value)| name == "session_state" && value == "upstream-session"));
+    assert!(app_redirect.query_pairs().any(|(name, _)| name == "iss"));
     app_redirect
         .query_pairs()
         .find(|(name, _)| name == "code")
@@ -228,7 +507,8 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
         client_id: "application".into(),
         client_secret: SecretString::new("application-secret"),
     };
-    let (app, _, task) = setup("github", auth, KeyStrategy::SingleSegment).await;
+    let (app, _, task, capture) =
+        setup_with_capture("github", auth, KeyStrategy::SingleSegment, None).await;
     let code = authorization_code(&app, "github", None).await;
     let form = serde_urlencoded::to_string([
         ("grant_type", "authorization_code"),
@@ -242,18 +522,30 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
         post_token(&app, "github", &form).await.status(),
         StatusCode::CREATED
     );
-    let refresh = serde_urlencoded::to_string([
-        ("grant_type", "refresh_token"),
-        ("refresh_token", "refresh"),
-        ("client_id", "application"),
-        ("client_secret", "application-secret"),
-    ])
-    .unwrap();
-    let response = post_token(&app, "github", &refresh).await;
+    let refresh = "grant_type=refresh_token&refresh_token=refresh&client_id=application&client_secret=application-secret&client_assertion=downstream-only&scope=openid&resource=one&resource=two";
+    let response = post_token(&app, "github", refresh).await;
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(
         response.headers()[header::CONTENT_TYPE],
         "application/vnd.oauth-refresh+json"
+    );
+    let upstream_refresh = capture.token.lock().unwrap().last().unwrap().clone();
+    assert!(upstream_refresh
+        .iter()
+        .any(|pair| pair == &("client_id".into(), "upstream-client".into())));
+    assert!(upstream_refresh
+        .iter()
+        .any(|pair| pair == &("client_secret".into(), "upstream-secret".into())));
+    assert!(!upstream_refresh
+        .iter()
+        .any(|(name, value)| name == "client_assertion" || value == "application-secret"));
+    assert_eq!(
+        upstream_refresh
+            .iter()
+            .filter(|(name, _)| name == "resource")
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "two"]
     );
     let invalid = refresh.replace("application-secret", "wrong");
     assert_eq!(
@@ -349,7 +641,7 @@ async fn upstream_authorization_errors_relay_only_to_validated_redirect() {
     let response = app
         .oneshot(
             Request::get(format!(
-                "/oidc/google/callback?error=access_denied&error_description=declined&state={state}"
+                "/oidc/google/callback?error=access_denied&error_description=declined&error_uri=https%3A%2F%2Fissuer.example%2Ferrors%2Fdenied&state={state}"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -360,8 +652,280 @@ async fn upstream_authorization_errors_relay_only_to_validated_redirect() {
     let redirect = Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
     assert_eq!(redirect.host_str(), Some("app.example"));
     assert!(redirect.query().unwrap().contains("error=access_denied"));
+    assert!(redirect.query().unwrap().contains("error_uri="));
     assert!(redirect.query().unwrap().contains("state=application"));
     task.abort();
+}
+
+#[tokio::test]
+async fn authorization_relay_preserves_extensions_and_applies_scope_policy() {
+    let verifier = "relay-verifier-with-at-least-forty-three-characters";
+    let challenge = pkce_challenge(verifier);
+    let (app, _, task, _) = setup_with_capture(
+        "relay",
+        ClientAuth::Public,
+        KeyStrategy::SingleSegment,
+        Some(vec!["openid".into(), "email".into()]),
+    )
+    .await;
+    let request = format!(
+        "/oidc/relay/authorize?client_id=downstream&response_type=code&response_mode=query&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=downstream-state&code_challenge={challenge}&code_challenge_method=S256&scope=email%20openid&nonce=nonce-value&prompt=consent&login_hint=user%40example.com&access_type=offline&resource=one&resource=two"
+    );
+    let response = app
+        .clone()
+        .oneshot(Request::get(request).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let upstream = Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let pairs: Vec<_> = upstream.query_pairs().into_owned().collect();
+    let values = |name: &str| {
+        pairs
+            .iter()
+            .filter(|(candidate, _)| candidate == name)
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values("client_id"), ["upstream-client"]);
+    assert_eq!(values("response_type"), ["code"]);
+    assert_eq!(values("scope"), ["email openid"]);
+    assert_eq!(values("nonce"), ["nonce-value"]);
+    assert_eq!(values("prompt"), ["consent"]);
+    assert_eq!(values("login_hint"), ["user@example.com"]);
+    assert_eq!(values("access_type"), ["offline"]);
+    assert_eq!(values("resource"), ["one", "two"]);
+    assert_ne!(values("state"), ["downstream-state"]);
+    assert_ne!(values("code_challenge"), [challenge.as_str()]);
+
+    for invalid in [
+        format!(
+            "/oidc/relay/authorize?code_challenge={challenge}&code_challenge_method=S256&scope=admin"
+        ),
+        format!(
+            "/oidc/relay/authorize?code_challenge={challenge}&code_challenge_method=S256&request=opaque"
+        ),
+        format!(
+            "/oidc/relay/authorize?code_challenge={challenge}&code_challenge_method=S256&response_mode=form_post"
+        ),
+        format!(
+            "/oidc/relay/authorize?code_challenge={challenge}&code_challenge_method=S256&nonce=one&nonce=two"
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(invalid).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    task.abort();
+}
+
+fn validate_fixture_id_token(
+    token: &str,
+    jwks: &Value,
+    issuer: &str,
+    nonce: &str,
+    access_token: &str,
+) -> Result<Value, String> {
+    let header = decode_header(token).map_err(|error| error.to_string())?;
+    let set: JwkSet = serde_json::from_value(jwks.clone()).map_err(|error| error.to_string())?;
+    let key = set
+        .keys
+        .iter()
+        .find(|key| key.common.key_id.as_deref() == header.kid.as_deref())
+        .ok_or("unknown kid")?;
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[issuer]);
+    validation.set_audience(&["upstream-client"]);
+    let claims = decode::<Value>(
+        token,
+        &DecodingKey::from_jwk(key).map_err(|error| error.to_string())?,
+        &validation,
+    )
+    .map_err(|error| error.to_string())?
+    .claims;
+    if claims.get("nonce").and_then(Value::as_str) != Some(nonce) {
+        return Err("nonce mismatch".into());
+    }
+    let expected_at_hash = URL_SAFE_NO_PAD.encode(&Sha256::digest(access_token.as_bytes())[..16]);
+    if claims.get("at_hash").and_then(Value::as_str) != Some(expected_at_hash.as_str()) {
+        return Err("at_hash mismatch".into());
+    }
+    Ok(claims)
+}
+
+async fn run_signed_relay_profile(profile: RelayProfile) {
+    let (app, fixture, task, redirect_uri, client_auth) = setup_signed_profile(profile).await;
+    let nonce = "relying-party-nonce";
+    let verifier = "profile-verifier-with-at-least-forty-three-characters";
+    let mut authorize = Url::parse("https://mux.example/oidc/profile/authorize").unwrap();
+    authorize
+        .query_pairs_mut()
+        .append_pair("client_id", "upstream-client")
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("state", "relying-party-state")
+        .append_pair("scope", "openid email profile")
+        .append_pair("nonce", nonce);
+    if profile == RelayProfile::Google {
+        authorize
+            .query_pairs_mut()
+            .append_pair("code_challenge", &pkce_challenge(verifier))
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("access_type", "offline")
+            .append_pair("prompt", "consent")
+            .append_pair("login_hint", "person@example.com")
+            .append_pair("hd", "example.com");
+    }
+    let mux_authorize = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "{}?{}",
+                authorize.path(),
+                authorize.query().unwrap()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mux_authorize.status(), StatusCode::FOUND);
+    let upstream = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .get(mux_authorize.headers()[header::LOCATION].to_str().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upstream.status(), StatusCode::FOUND);
+    let callback = Url::parse(upstream.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let mux_callback = app
+        .clone()
+        .oneshot(
+            Request::get(format!("{}?{}", callback.path(), callback.query().unwrap()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mux_callback.status(), StatusCode::FOUND);
+    let application =
+        Url::parse(mux_callback.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    assert_eq!(
+        application
+            .query_pairs()
+            .find(|(name, _)| name == "state")
+            .unwrap()
+            .1,
+        "relying-party-state"
+    );
+    let code = application
+        .query_pairs()
+        .find(|(name, _)| name == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    let mut token_form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+    ];
+    match client_auth {
+        ClientAuth::Public => token_form.push(("code_verifier", verifier)),
+        ClientAuth::ClientSecret { .. } => {
+            token_form.push(("client_id", "upstream-client"));
+            token_form.push(("client_secret", "upstream-secret"));
+        }
+        ClientAuth::PrivateKeyJwt { .. } => unreachable!(),
+    }
+    let token = post_token(
+        &app,
+        "profile",
+        &serde_urlencoded::to_string(token_form).unwrap(),
+    )
+    .await;
+    assert_eq!(token.status(), StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response_body(token).await).unwrap();
+    let access_token = body["access_token"].as_str().unwrap();
+    let claims = validate_fixture_id_token(
+        body["id_token"].as_str().unwrap(),
+        &fixture.jwks,
+        &fixture.issuer,
+        nonce,
+        access_token,
+    )
+    .unwrap();
+    assert_eq!(claims["email"], "person@example.com");
+    assert!(validate_fixture_id_token(
+        body["id_token"].as_str().unwrap(),
+        &fixture.jwks,
+        &fixture.issuer,
+        "wrong-nonce",
+        access_token,
+    )
+    .is_err());
+
+    if profile == RelayProfile::Google {
+        {
+            let authorize = fixture.authorize.lock().unwrap();
+            for expected in [
+                ("access_type", "offline"),
+                ("prompt", "consent"),
+                ("login_hint", "person@example.com"),
+                ("hd", "example.com"),
+            ] {
+                assert!(authorize
+                    .iter()
+                    .any(|(name, value)| name == expected.0 && value == expected.1));
+            }
+        }
+        assert_eq!(claims["iss"], "https://accounts.google.com");
+        assert_eq!(claims["hd"], "example.com");
+        let refresh = post_token(
+            &app,
+            "profile",
+            "grant_type=refresh_token&refresh_token=fixture-refresh-token&scope=openid%20email&resource=google-resource",
+        )
+        .await;
+        let refreshed: Value = serde_json::from_slice(&response_body(refresh).await).unwrap();
+        assert_eq!(refreshed["access_token"], "fixture-refreshed-access-token");
+        assert!(refreshed.get("refresh_token").is_none());
+        let invalid_scope = post_token(
+            &app,
+            "profile",
+            "grant_type=refresh_token&refresh_token=fixture-refresh-token&scope=admin",
+        )
+        .await;
+        assert_eq!(invalid_scope.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8(response_body(invalid_scope).await)
+            .unwrap()
+            .contains("invalid_scope"));
+    } else {
+        let userinfo = reqwest::Client::new()
+            .get(fixture.base.join("userinfo").unwrap())
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(userinfo.status(), StatusCode::OK);
+        let user: Value = userinfo.json().await.unwrap();
+        assert_eq!(user["sub"], claims["sub"]);
+        assert_eq!(user["email"], claims["email"]);
+    }
+    task.abort();
+}
+
+#[tokio::test]
+async fn google_shaped_relay_preserves_provider_parameters_and_tokens() {
+    run_signed_relay_profile(RelayProfile::Google).await;
+}
+
+#[tokio::test]
+async fn cognito_shaped_relying_party_uses_manual_trust_endpoints() {
+    run_signed_relay_profile(RelayProfile::Cognito).await;
 }
 
 #[tokio::test]

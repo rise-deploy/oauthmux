@@ -122,6 +122,7 @@ mod tests {
                 client_id: "id".into(),
                 client_secret: SecretString::new("secret"),
                 scopes: vec![],
+                allowed_scopes: None,
             },
             client_auth: ClientAuth::Public,
             allowed_redirect_origins: vec![],

@@ -47,15 +47,14 @@ flowchart LR
 
 | Mode | Issuer and token signer | Endpoint ownership | Status |
 | --- | --- | --- | --- |
-| Transparent relay | Upstream | oauthmux serves `authorize` and `token`; upstream serves `jwks` and `userinfo` | Target |
+| Transparent relay | Upstream | oauthmux serves `authorize` and `token`; upstream serves `jwks` and `userinfo` | Supported with manual endpoint configuration |
 | Brokered issuer | oauthmux | oauthmux serves discovery, `authorize`, `token`, `jwks`, and `userinfo` | Target |
 
-The transport core required by both modes is implemented: oauthmux performs the upstream code
-exchange and returns the upstream token response unchanged. Its discovery document identifies
-oauthmux as the issuer while its `jwks` endpoint and returned ID token belong to the upstream
-issuer. That issuer mismatch means the current discovery document is not a complete OIDC trust
-contract. A client must validate the raw ID token against the configured upstream issuer and
-audience.
+oauthmux performs the upstream code exchange and returns the upstream token response unchanged.
+Its discovery document identifies oauthmux as the issuer while its `jwks` endpoint and returned
+ID token belong to the upstream issuer. That issuer mismatch means the discovery document is not
+a complete OIDC trust contract. A client must validate the raw ID token against the configured
+upstream issuer and audience.
 
 Transparent relay keeps the upstream `iss` claim, signature, JWKS, and UserInfo contract. The
 relying party explicitly configures the upstream issuer and routes only its authorization and
@@ -68,10 +67,6 @@ Brokered issuer makes oauthmux the downstream issuer. oauthmux validates the ups
 issues a new token with its own `iss`, audience, signature, and JWKS. This is a new trust boundary,
 not a transparent relay. The upstream issuer does not authorize oauthmux to issue tokens under
 the upstream identity.
-
-These semantics belong to each instance because different upstreams and relying parties can need
-different trust models. A deployment-wide default can reduce repetition without preventing a
-deployment from hosting both modes.
 
 ### Amazon Cognito
 
@@ -90,10 +85,9 @@ input][cognito-oidc-idp] specifically for non-typical endpoint paths and alterna
 
 Cognito sends the client credentials with `client_secret_post`, which matches oauthmux's
 shared-secret client authentication. The Cognito `/oauth2/idpresponse` origin must be in the
-instance's redirect allow-list.
-
-The `nonce` gap below prevents this flow from being Cognito-compatible yet: Cognito [generates and
-validates a nonce][cognito-id-token] when it federates through a third-party identity provider.
+instance's redirect allow-list. oauthmux forwards the [Cognito-generated nonce][cognito-id-token]
+to the upstream issuer without changing it, so Cognito can validate the nonce in the returned
+upstream ID token.
 
 [oidc-discovery]: https://openid.net/specs/openid-connect-discovery-1_0-errata1.html
 [cognito-oidc-idp]: https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-oidc-idp.html
@@ -107,6 +101,17 @@ validates a nonce][cognito-id-token] when it federates through a third-party ide
 mise install
 mise run check
 ```
+
+The Docker-backed suite runs a complete browserless authorization-code and refresh flow against a
+pinned local Dex server:
+
+```console
+mise run e2e
+```
+
+Docker Compose is required for `e2e`; the regular `check` task remains Docker-free. The in-process
+suite uses a generic signed OIDC fixture with small Google- and Cognito-shaped profiles. No test
+contacts Google or Amazon Cognito.
 
 The workspace contains the protocol engine, File and SSM providers, and the `oauthmux` binary.
 Provider crates depend on `oauthmux-core`; the core has no provider-specific dependencies.
@@ -122,6 +127,7 @@ instances:
     client_id: 1234.apps.googleusercontent.com
     client_secret: ${GOOGLE_SECRET}
     scopes: [openid, email, profile]
+    allowed_scopes: [openid, email, profile]
     allowed_redirect_origins: [https://app.example.com]
     default_redirect_uri: https://app.example.com/oauth/callback
     client_auth:
@@ -145,6 +151,10 @@ The stable callback registered with the upstream provider is
 The File provider accepts either `client_secret` or `client_secret_file`, exactly one per
 instance. A value whose complete form is `${VAR}` is resolved from the process environment.
 Invalid reloads retain the last valid snapshot.
+
+`scopes` supplies the upstream scope when an authorization request omits `scope`. A supplied
+scope is forwarded unchanged. Optional `allowed_scopes` restricts both configured defaults and
+requested scopes; omitting it leaves scope authorization to the upstream provider.
 
 ## SSM provider
 
@@ -224,12 +234,23 @@ Redirect targets require an exact configured HTTP(S) origin. HTTP loopback targe
 `localhost`, `127.0.0.1`, and `::1` are also valid for local development. Wildcards and URL-prefix
 matching are not used.
 
+## Transparent request relay
+
+The authorization endpoint forwards parameters it does not own, including `nonce`, `prompt`,
+`login_hint`, `access_type`, `hd`, and provider extensions. It replaces the upstream `client_id`,
+callback `redirect_uri`, sealed `state`, and PKCE fields, and constrains `response_type` to `code`.
+Only query response mode is supported. OIDC `request` and `request_uri` objects are rejected
+because their embedded routing fields cannot be safely reconciled with the proxy-owned values.
+
+The callback preserves upstream response extensions while replacing the upstream code and state
+with the sealed application code and original application state. Refresh requests preserve
+grant extensions and replace only downstream client authentication with the upstream client
+credentials. Token and refresh response status, content type, and body bytes remain unchanged.
+
 ## Known gaps
 
-- The authorization endpoint does not accept or forward `nonce`. An OIDC relying party cannot
-  bind the upstream ID token to its authorization request, and Cognito's third-party IdP flow
-  cannot validate the nonce it generates.
-- Transparent relay behavior and instance-level relay/broker selection are not implemented.
+- Instance-level relay/broker selection and relay-compatible discovery are not implemented.
+  Transparent relay requires a relying party that supports manual endpoint configuration.
 - Brokered issuer requires upstream-token validation, downstream token issuance, an oauthmux-owned
   JWKS, and UserInfo support.
 - Redirect trust policy supports origins only. It needs explicit matcher types for exact callback

@@ -51,8 +51,8 @@ first and port code from it** rather than re-deriving the protocol logic:
 - Secret comparisons are constant-time (use the `subtle` crate).
 - The token endpoint is RFC 6749-compliant: form-encoded request, JSON response, proper
   `error`/`error_description` bodies, CORS support (`POST` + preflight `OPTIONS`).
-- Discovery responses rewrite upstream endpoint URLs to the proxy's own URLs; JWKS is proxied
-  from upstream.
+- Relay metadata preserves the upstream issuer and JWKS URL while routing authorization and token
+  endpoints through the proxy. JWKS is also available through the proxy endpoint.
 - The upstream token response is passed through faithfully on exchange (preserve body,
   content-type, and status from upstream rather than re-encoding lossily).
 
@@ -206,7 +206,7 @@ All under the mounted prefix, per instance key `K` (shown single-segment):
 | `GET /oidc/{K}/authorize` | Validates the application redirect and downstream PKCE, seals application state, and generates independent upstream state and PKCE. oauthmux replaces `client_id`, `redirect_uri`, `state`, `code_challenge`, and `code_challenge_method`; constrains the flow to authorization code with query response mode; and forwards the remaining query pairs. A supplied `scope` is preserved subject to `allowed_scopes`; configured `scopes` is the fallback. OIDC request objects are rejected. |
 | `GET /oidc/{K}/callback` | Unseals and validates state (TTL 10 min, instance key match), exchanges the upstream code with the upstream credentials and PKCE verifier, and seals the raw token response into the application code. The application receives its original state and all non-owned upstream response parameters. |
 | `POST /oidc/{K}/token` | Form-encoded, RFC 6749. `authorization_code` authenticates the application, validates TTL/replay/redirect/PKCE, and returns the stored upstream response verbatim. `refresh_token` authenticates the application, preserves grant extensions, replaces downstream client authentication with upstream credentials, and relays the upstream response. CORS reflects allowed origins and supports preflight `OPTIONS`. |
-| `GET /oidc/{K}/.well-known/openid-configuration` | Fetch upstream discovery (if OIDC), rewrite `issuer`, `authorization_endpoint`, `token_endpoint`, `jwks_uri` to `{public_url}/oidc/{K}/…`. For non-OIDC instances, synthesize a minimal document from the configured endpoints. |
+| `GET /oidc/{K}/.well-known/openid-configuration` | Fetch upstream discovery (if OIDC), preserve its `issuer` and `jwks_uri`, and rewrite `authorization_endpoint` and `token_endpoint` to `{public_url}/oidc/{K}/…`. For instances with explicit endpoints, synthesize the same relay metadata from configuration. This endpoint supports manual client configuration; its URL and upstream `issuer` do not form a standard OIDC Discovery contract. |
 | `GET /oidc/{K}/jwks` | Proxy upstream JWKS (cache ~10 min). 404 for instances with no JWKS. |
 | `GET /healthz` | Liveness (binary only, not part of the embeddable router). |
 | `GET /readyz` | Ready once every configured provider has delivered its first snapshot (binary only). |

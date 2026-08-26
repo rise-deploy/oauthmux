@@ -1,5 +1,6 @@
 [tools]
 actionlint = "1.7.12"
+node = "24.19.0"
 rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 shellcheck = "0.11.0"
 
@@ -10,7 +11,13 @@ run = [
   "cargo fmt --all -- --check",
   "cargo clippy --workspace --all-targets --all-features -- -D warnings",
   "cargo test --workspace --all-features",
+  "mise run docs",
 ]
+
+[tasks.docs]
+description = "Build the documentation site"
+dir = "docs"
+run = "npm ci && npm run build"
 
 [tasks.e2e]
 description = "Run Docker-backed end-to-end tests"

@@ -16,6 +16,35 @@ env:
   PUBLISH: ${{ github.event_name == 'push' || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'preview')) }}
 
 jobs:
+  docs:
+    if: github.event.action != 'labeled' || github.event.label.name == 'preview'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build documentation
+        uses: withastro/action@v6
+        with:
+          path: docs
+          node-version: 24.19.0
+
+  deploy-docs:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    needs: docs
+    concurrency:
+      group: github-pages
+      cancel-in-progress: true
+    permissions:
+      pages: write
+      id-token: write
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish documentation
+        id: deployment
+        uses: actions/deploy-pages@v5
+
   rust:
     if: github.event.action != 'labeled' || github.event.label.name == 'preview'
     runs-on: blacksmith-4vcpu-ubuntu-2404

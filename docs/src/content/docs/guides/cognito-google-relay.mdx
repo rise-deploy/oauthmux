@@ -1,0 +1,111 @@
+---
+title: Cognito relay to Google
+description: Connect an Amazon Cognito user pool to Google through oauthmux transparent relay.
+sidebar:
+  order: 1
+---
+
+import Mermaid from '../../../components/Mermaid.astro';
+
+This layout gives Google one stable oauthmux callback while Amazon Cognito remains the relying
+party. Cognito talks to oauthmux for authorization and token exchange, then validates Google's ID
+token and obtains claims from Google's UserInfo endpoint.
+
+<Mermaid
+  label="A Cognito user pool relays authorization and token traffic through oauthmux to Google while validating Google identity directly."
+  chart={`flowchart LR
+    B[Browser]
+    C[Cognito user pool]
+    M[oauthmux]
+    G[Google OAuth]
+
+    B --> C
+    C -->|authorize and token| M
+    M -->|authorize and code exchange| G
+    G -->|oauthmux callback| M
+    M -->|Google-signed tokens| C
+    C -.->|JWKS and UserInfo| G`}
+/>
+
+## The three configurations
+
+### 1. Google OAuth client
+
+Create a web OAuth client in the Google project. Register exactly the stable callback for the
+oauthmux instance:
+
+```text
+https://login.example.com/oidc/google/callback
+```
+
+The client needs the OpenID Connect scopes Cognito will request, normally `openid`, `email`, and
+`profile`. Keep the Google client ID and secret available for both the oauthmux upstream
+configuration and the Cognito provider configuration.
+
+### 2. oauthmux instance
+
+Configure Google as the upstream issuer and permit the origin of Cognito's hosted-domain callback.
+The shared-secret client authentication values match the credentials Cognito sends to oauthmux's
+token endpoint.
+
+```yaml
+instances:
+  google:
+    issuer_url: https://accounts.google.com
+    authorization_endpoint: https://accounts.google.com/o/oauth2/v2/auth
+    token_endpoint: https://oauth2.googleapis.com/token
+    jwks_uri: https://www.googleapis.com/oauth2/v3/certs
+    client_id: 123456789.apps.googleusercontent.com
+    client_secret: ${GOOGLE_CLIENT_SECRET}
+    scopes: [openid, email, profile]
+    allowed_scopes: [openid, email, profile]
+    allowed_redirect_origins:
+      - https://example.auth.eu-west-1.amazoncognito.com
+    client_auth:
+      mode: client_secret
+      client_id: 123456789.apps.googleusercontent.com
+      client_secret: ${GOOGLE_CLIENT_SECRET}
+```
+
+The allow-list contains an origin, not a path. Cognito's actual redirect is
+`https://example.auth.eu-west-1.amazoncognito.com/oauth2/idpresponse`, and oauthmux validates its
+origin before starting the flow.
+
+### 3. Cognito OIDC provider
+
+Add an OIDC provider to the user pool using manual input. Keep trust fields pointed at Google and
+route only the authorization and token fields through oauthmux.
+
+```json
+{
+  "ProviderDetails": {
+    "client_id": "123456789.apps.googleusercontent.com",
+    "client_secret": "<Google OAuth client secret>",
+    "authorize_scopes": "openid email profile",
+    "oidc_issuer": "https://accounts.google.com",
+    "authorize_url": "https://login.example.com/oidc/google/authorize",
+    "token_url": "https://login.example.com/oidc/google/token",
+    "attributes_url": "https://openidconnect.googleapis.com/v1/userinfo",
+    "attributes_request_method": "GET",
+    "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs"
+  }
+}
+```
+
+Map the Google claims Cognito needs, enable this provider on the intended user-pool app client,
+and include it in the hosted UI's identity-provider choices.
+
+## Correctness checks
+
+- Google lists the oauthmux callback, not Cognito's `/oauth2/idpresponse`, as its redirect URI.
+- oauthmux allows the exact Cognito hosted-domain origin.
+- Cognito's issuer, JWKS, and UserInfo fields point directly to Google.
+- Cognito's authorization and token fields point to the same oauthmux instance.
+- The Google client ID is Cognito's provider client ID so the Google ID token audience is valid.
+
+oauthmux forwards Cognito's nonce to Google and returns Google's token response unchanged. Cognito
+therefore validates the nonce, audience, issuer, and signature against the identity Google issued.
+
+See the [Google OpenID Connect documentation](https://developers.google.com/identity/openid-connect/openid-connect)
+and [Cognito OIDC provider documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-oidc-idp.html)
+for the provider-side settings represented here.

@@ -51,10 +51,9 @@ flowchart LR
 | Brokered issuer | oauthmux | oauthmux serves discovery, `authorize`, `token`, `jwks`, and `userinfo` | Target |
 
 oauthmux performs the upstream code exchange and returns the upstream token response unchanged.
-Its discovery document identifies oauthmux as the issuer while its `jwks` endpoint and returned
-ID token belong to the upstream issuer. That issuer mismatch means the discovery document is not
-a complete OIDC trust contract. A client must validate the raw ID token against the configured
-upstream issuer and audience.
+Its relay metadata preserves the upstream `issuer` and `jwks_uri` while routing the
+`authorization_endpoint` and `token_endpoint` through oauthmux. A client validates the raw ID
+token against the configured upstream issuer and audience.
 
 Transparent relay keeps the upstream `iss` claim, signature, JWKS, and UserInfo contract. The
 relying party explicitly configures the upstream issuer and routes only its authorization and
@@ -145,8 +144,9 @@ cargo run -p oauthmux
 ```
 
 The stable callback registered with the upstream provider is
-`https://auth.example.com/oidc/google/callback`. Applications use the corresponding `authorize`,
-`token`, discovery, and `jwks` endpoints under `/oidc/google/`.
+`https://auth.example.com/oidc/google/callback`. Applications route authorization and token
+requests through the corresponding endpoints under `/oidc/google/` and retain the upstream
+issuer, JWKS, and UserInfo endpoints as their trust configuration.
 
 The File provider accepts either `client_secret` or `client_secret_file`, exactly one per
 instance. A value whose complete form is `${VAR}` is resolved from the process environment.
@@ -249,8 +249,9 @@ credentials. Token and refresh response status, content type, and body bytes rem
 
 ## Known gaps
 
-- Instance-level relay/broker selection and relay-compatible discovery are not implemented.
-  Transparent relay requires a relying party that supports manual endpoint configuration.
+- Instance-level relay/broker selection is not implemented. Transparent relay requires a relying
+  party that supports manual endpoint configuration because standard OIDC discovery does not
+  allow a metadata URL hosted by oauthmux to identify the upstream issuer.
 - Brokered issuer requires upstream-token validation, downstream token issuance, an oauthmux-owned
   JWKS, and UserInfo support.
 - Redirect trust policy supports origins only. It needs explicit matcher types for exact callback

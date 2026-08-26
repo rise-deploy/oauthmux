@@ -826,11 +826,23 @@ async fn discovery(state: &AppState, instance: &Instance) -> Response {
         Err(status) => return status.into_response(),
     };
     let base = instance_base_url(&state.cfg.public_url, &instance.key);
-    doc["issuer"] = Value::String(base.to_string().trim_end_matches('/').to_owned());
+    let issuer = doc
+        .get("issuer")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            let issuer = &instance.upstream.issuer_url;
+            if issuer.path() == "/" {
+                issuer.as_str().trim_end_matches('/').to_owned()
+            } else {
+                issuer.to_string()
+            }
+        });
+    doc["issuer"] = Value::String(issuer);
     doc["authorization_endpoint"] = Value::String(base.join("authorize").unwrap().to_string());
     doc["token_endpoint"] = Value::String(base.join("token").unwrap().to_string());
-    if endpoints.jwks_uri.is_some() {
-        doc["jwks_uri"] = Value::String(base.join("jwks").unwrap().to_string());
+    if let Some(jwks_uri) = endpoints.jwks_uri {
+        doc["jwks_uri"] = Value::String(jwks_uri.to_string());
     } else if let Some(object) = doc.as_object_mut() {
         object.remove("jwks_uri");
     }

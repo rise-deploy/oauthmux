@@ -325,7 +325,7 @@ async fn setup(
     auth: ClientAuth,
     strategy: KeyStrategy,
 ) -> (Router, Arc<XChaChaSealer>, tokio::task::JoinHandle<()>) {
-    let (app, sealer, task, _) = setup_with_capture(key, auth, strategy, None).await;
+    let (app, sealer, task, _) = setup_with_capture(key, auth, strategy, None, false).await;
     (app, sealer, task)
 }
 
@@ -334,6 +334,7 @@ async fn setup_with_capture(
     auth: ClientAuth,
     strategy: KeyStrategy,
     allowed_scopes: Option<Vec<String>>,
+    explicit_endpoints: bool,
 ) -> (
     Router,
     Arc<XChaChaSealer>,
@@ -356,13 +357,16 @@ async fn setup_with_capture(
     let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
 
     let key = InstanceKey::new(key).unwrap();
+    let authorization_endpoint = explicit_endpoints.then(|| base.join("authorize").unwrap());
+    let token_endpoint = explicit_endpoints.then(|| base.join("token").unwrap());
+    let jwks_uri = explicit_endpoints.then(|| base.join("jwks").unwrap());
     let instance = Arc::new(Instance {
         key: key.clone(),
         upstream: UpstreamSpec {
             issuer_url: base,
-            authorization_endpoint: None,
-            token_endpoint: None,
-            jwks_uri: None,
+            authorization_endpoint,
+            token_endpoint,
+            jwks_uri,
             client_id: "upstream-client".into(),
             client_secret: SecretString::new("upstream-secret"),
             scopes: vec!["openid".into(), "email".into()],
@@ -508,7 +512,7 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
         client_secret: SecretString::new("application-secret"),
     };
     let (app, _, task, capture) =
-        setup_with_capture("github", auth, KeyStrategy::SingleSegment, None).await;
+        setup_with_capture("github", auth, KeyStrategy::SingleSegment, None, false).await;
     let code = authorization_code(&app, "github", None).await;
     let form = serde_urlencoded::to_string([
         ("grant_type", "authorization_code"),
@@ -666,6 +670,7 @@ async fn authorization_relay_preserves_extensions_and_applies_scope_policy() {
         ClientAuth::Public,
         KeyStrategy::SingleSegment,
         Some(vec!["openid".into(), "email".into()]),
+        false,
     )
     .await;
     let request = format!(
@@ -929,7 +934,7 @@ async fn cognito_shaped_relying_party_uses_manual_trust_endpoints() {
 }
 
 #[tokio::test]
-async fn discovery_and_jwks_are_rewritten_and_proxied() {
+async fn discovery_preserves_upstream_trust_and_rewrites_relay_endpoints() {
     let (app, _, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;
     let response = app
         .clone()
@@ -942,7 +947,8 @@ async fn discovery_and_jwks_are_rewritten_and_proxied() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let value: Value = serde_json::from_slice(&response_body(response).await).unwrap();
-    assert_eq!(value["issuer"], "https://mux.example/oidc/google");
+    let issuer = value["issuer"].as_str().unwrap();
+    assert!(issuer.starts_with("http://127.0.0.1:"));
     assert_eq!(
         value["authorization_endpoint"],
         "https://mux.example/oidc/google/authorize"
@@ -951,7 +957,7 @@ async fn discovery_and_jwks_are_rewritten_and_proxied() {
         value["token_endpoint"],
         "https://mux.example/oidc/google/token"
     );
-    assert_eq!(value["jwks_uri"], "https://mux.example/oidc/google/jwks");
+    assert_eq!(value["jwks_uri"], format!("{issuer}jwks"));
     assert_eq!(value["custom_field"], "preserved");
     let jwks = app
         .oneshot(
@@ -962,6 +968,40 @@ async fn discovery_and_jwks_are_rewritten_and_proxied() {
         .await
         .unwrap();
     assert_eq!(jwks.status(), StatusCode::OK);
+    task.abort();
+}
+
+#[tokio::test]
+async fn explicit_endpoints_produce_transparent_relay_metadata() {
+    let (app, _, task, _) = setup_with_capture(
+        "google",
+        ClientAuth::Public,
+        KeyStrategy::SingleSegment,
+        None,
+        true,
+    )
+    .await;
+    let response = app
+        .oneshot(
+            Request::get("/oidc/google/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+    let issuer = value["issuer"].as_str().unwrap();
+    assert!(issuer.starts_with("http://127.0.0.1:"));
+    assert_eq!(
+        value["authorization_endpoint"],
+        "https://mux.example/oidc/google/authorize"
+    );
+    assert_eq!(
+        value["token_endpoint"],
+        "https://mux.example/oidc/google/token"
+    );
+    assert_eq!(value["jwks_uri"], format!("{issuer}/jwks"));
     task.abort();
 }
 

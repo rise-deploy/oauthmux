@@ -1,325 +1,96 @@
 # oauthmux
 
-`oauthmux` gives each OAuth/OIDC configuration one stable upstream callback URL and safely
-multiplexes the result to an explicit set of application origins. It is both an embeddable Axum
-router and a standalone server for containers or AWS Lambda.
+`oauthmux` gives an external OAuth/OIDC client one stable callback and safely relays authorization
+results to an explicit set of application origins. It is an embeddable Axum router and a standalone
+server for native, container, and AWS Lambda deployments.
 
-The proxy supports authorization code flows with S256 PKCE, refresh tokens, OIDC discovery,
-JWKS proxying, public and shared-secret application clients, and RFC 7523 `private_key_jwt`
-clients. Upstream token response status, content type, and bytes are preserved during exchange.
-
-## Upstream trust modes
-
-Endpoint routing and token trust are separate concerns. An application can send authorization
-and token requests through oauthmux while continuing to trust the upstream issuer, or it can
-trust oauthmux as an issuer that validates and reissues the upstream identity.
-
-### Transparent relay
+An **upstream** represents one provider OAuth client, its credentials, and its stable callback. A
+**relay** references that upstream and defines downstream authentication, scopes, and redirect
+policy. Several relays can share one upstream without adding provider callbacks.
 
 ```mermaid
 flowchart LR
-    RP[Client or relying party]
-    M[oauthmux]
-    U[Upstream issuer]
+    RP[Relying parties]
+    M[oauthmux relay]
+    U[Upstream OAuth client]
 
     RP -->|authorize and token| M
     M -->|authorization and code exchange| U
-    U -->|upstream-signed response| M
-    M -->|unchanged response| RP
-    RP -.->|trust issuer and JWKS| U
+    U -->|one stable callback| M
+    M -->|validated application redirect| RP
 ```
 
-### Brokered issuer
+## Operating modes
 
-```mermaid
-flowchart LR
-    RP[Client or relying party]
-    M[oauthmux]
-    U[Upstream issuer]
+| Mode | Token issuer and signer | Status |
+| --- | --- | --- |
+| Transparent relay | Upstream provider | Available |
+| Brokered issuer | oauthmux | Planned |
 
-    RP -->|authorize and token| M
-    M -->|authorization and code exchange| U
-    U -->|upstream-signed response| M
-    M -->|new oauthmux-signed response| RP
-    M -.->|validate upstream issuer and JWKS| U
-    RP -.->|trust oauthmux issuer and JWKS| M
+Transparent relay returns the upstream token response unchanged. The relying party continues to
+trust the upstream issuer, JWKS, audience, and UserInfo endpoint while routing authorization and
+token requests through oauthmux. This requires a relying party that supports manual endpoint
+configuration; Amazon Cognito is one example.
+
+Brokered issuer will validate the upstream identity and issue a new oauthmux-signed identity. It is
+a separate trust model with its own signing keys, JWKS, audience, claims, and UserInfo contract.
+
+## Capabilities
+
+- Authorization-code flow with independent upstream S256 PKCE.
+- Public, shared-secret, upstream-client, and RFC 7523 `private_key_jwt` relay authentication.
+- Exact redirect-origin policy and sealed state/code envelopes.
+- Transparent authorization, token, refresh, discovery metadata, and JWKS routing.
+- Multi-document File configuration with inline, environment, and file secrets.
+- AWS SSM resource discovery with SSM `SecureString` and Secrets Manager `jsonKey` references.
+- Invocation-driven Lambda configuration refresh with a 60-second default TTL.
+- Multi-architecture images at `ghcr.io/rise-deploy/oauthmux`.
+
+## Documentation
+
+- [Getting started](https://rise-deploy.github.io/oauthmux/getting-started/)
+- [Operating modes](https://rise-deploy.github.io/oauthmux/modes/)
+- [Cognito relay to Google](https://rise-deploy.github.io/oauthmux/guides/cognito-google-relay/)
+- [Configuration reference](https://rise-deploy.github.io/oauthmux/configuration/)
+- [File provider](https://rise-deploy.github.io/oauthmux/reference/file-provider/)
+- [AWS SSM provider](https://rise-deploy.github.io/oauthmux/reference/ssm-provider/)
+- [Runtime and deployment](https://rise-deploy.github.io/oauthmux/reference/runtime/)
+- [HTTP endpoints](https://rise-deploy.github.io/oauthmux/reference/http-endpoints/)
+
+The executable publishes its configuration contract directly:
+
+```console
+oauthmux schema > oauthmux.schema.json
 ```
-
-| Mode | Issuer and token signer | Endpoint ownership | Status |
-| --- | --- | --- | --- |
-| Transparent relay | Upstream | oauthmux serves `authorize` and `token`; upstream serves `jwks` and `userinfo` | Supported with manual endpoint configuration |
-| Brokered issuer | oauthmux | oauthmux serves discovery, `authorize`, `token`, `jwks`, and `userinfo` | Target |
-
-oauthmux performs the upstream code exchange and returns the upstream token response unchanged.
-Its relay metadata preserves the upstream `issuer` and `jwks_uri` while routing the
-`authorization_endpoint` and `token_endpoint` through oauthmux. A client validates the raw ID
-token against the configured upstream issuer and audience.
-
-Transparent relay keeps the upstream `iss` claim, signature, JWKS, and UserInfo contract. The
-relying party explicitly configures the upstream issuer and routes only its authorization and
-token requests through oauthmux. A discovery document fetched from an oauthmux URL cannot
-portably advertise the upstream issuer: [OIDC Discovery][oidc-discovery] requires the URL used to
-retrieve the metadata, the metadata `issuer`, and the ID token `iss` to match exactly. Consumers
-that support manual endpoint configuration can use this mode without token reissuance.
-
-Brokered issuer makes oauthmux the downstream issuer. oauthmux validates the upstream token and
-issues a new token with its own `iss`, audience, signature, and JWKS. This is a new trust boundary,
-not a transparent relay. The upstream issuer does not authorize oauthmux to issue tokens under
-the upstream identity.
-
-### Amazon Cognito
-
-Amazon Cognito supports the transparent-relay layout. Its OIDC provider setup offers [Manual
-input][cognito-oidc-idp] specifically for non-typical endpoint paths and alternate proxies.
-
-| Cognito provider detail | Value |
-| --- | --- |
-| `oidc_issuer` | Upstream issuer |
-| `authorize_url` | oauthmux `authorize` URL |
-| `token_url` | oauthmux `token` URL |
-| `attributes_url` | Upstream UserInfo URL |
-| `jwks_uri` | Upstream JWKS URL |
-| `client_id` | Upstream OAuth client ID |
-| `client_secret` | Upstream OAuth client secret; configure the same credentials for oauthmux client authentication |
-
-Cognito sends the client credentials with `client_secret_post`, which matches oauthmux's
-shared-secret client authentication. The Cognito `/oauth2/idpresponse` origin must be in the
-relay's redirect allow-list. oauthmux forwards the [Cognito-generated nonce][cognito-id-token]
-to the upstream issuer without changing it, so Cognito can validate the nonce in the returned
-upstream ID token.
-
-[oidc-discovery]: https://openid.net/specs/openid-connect-discovery-1_0-errata1.html
-[cognito-oidc-idp]: https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-oidc-idp.html
-[cognito-id-token]: https://docs.aws.amazon.com/cognito/latest/developerguide/amazon-cognito-user-pools-using-the-id-token.html
 
 ## Development
 
-[mise](https://mise.jdx.dev/) installs the repository's Rust toolchain:
+[mise](https://mise.jdx.dev/) installs the pinned Rust, Node.js, and validation tools:
 
 ```console
 mise install
 mise run check
-mise run docs:serve
-mise run schema
-```
-
-The Docker-backed suite runs a complete browserless authorization-code and refresh flow against a
-pinned local Dex server:
-
-```console
 mise run e2e
 ```
 
-Docker Compose is required for `e2e`; the regular `check` task remains Docker-free. The in-process
-suite uses a generic signed OIDC fixture with small Google- and Cognito-shaped profiles. No test
-contacts Google or Amazon Cognito.
-
-The workspace contains the protocol engine, File and SSM providers, and the `oauthmux` binary.
-Provider crates depend on `oauthmux-core`; the core has no provider-specific dependencies.
-
-## Quickstart with a file provider
-
-Create `config.yaml`:
-
-```yaml
-apiVersion: oauthmux.dev/v1alpha1
-kind: Upstream
-metadata:
-  name: google
-spec:
-  issuerUrl: https://accounts.google.com
-  oauthClient:
-    clientId: 1234.apps.googleusercontent.com
-    clientSecret:
-      valueFrom:
-        env:
-          name: GOOGLE_SECRET
----
-apiVersion: oauthmux.dev/v1alpha1
-kind: Relay
-metadata:
-  name: google
-spec:
-  upstreamRef:
-    name: google
-  scopes:
-    default: [openid, email, profile]
-    allowed: [openid, email, profile]
-  clientAuthentication:
-    type: Public
-  redirectPolicy:
-    allowedOrigins: [https://app.example.com]
-    defaultRedirectUri: https://app.example.com/oauth/callback
-```
-
-Then start the server:
+Serve the documentation locally with:
 
 ```console
-export GOOGLE_SECRET=upstream-client-secret
-export OAUTHMUX_PUBLIC_URL=https://auth.example.com
-export OAUTHMUX_SEAL_KEY="base64:$(openssl rand -base64 32)"
-export OAUTHMUX_PROVIDER_FILE="$PWD/config.yaml"
-cargo run -p oauthmux
+mise run docs:serve
 ```
 
-The stable callback registered with the upstream provider is
-`https://auth.example.com/oidc/upstreams/google/callback`. Applications route authorization and token
-requests through the corresponding endpoints under `/oidc/google/` and retain the upstream
-issuer, JWKS, and UserInfo endpoints as their trust configuration.
+The regular test suite uses in-process OAuth/OIDC fixtures. `mise run e2e` runs the standalone
+binary through a complete authorization-code and refresh flow against a pinned Dex container. No
+test contacts Google or Amazon Cognito.
 
-The File provider reads a multi-document YAML resource stream. Secret fields accept one explicit
-`value`, `valueFrom.env`, or `valueFrom.file` source. Relative files resolve from the configuration
-file's directory. Invalid reloads retain the complete last valid snapshot.
+The workspace contains:
 
-`scopes.default` supplies the upstream scope when an authorization request omits `scope`. A
-supplied scope is forwarded unchanged. Optional `scopes.allowed` restricts both configured
-defaults and requested scopes; omitting it leaves scope authorization to the upstream provider.
-
-## SSM provider
-
-Set `OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/`. Full resource documents use the SSM `String` type
-at `/oauthmux/upstreams/{name}` and `/oauthmux/relays/{name}`. The parameter path must agree with
-the document's kind and name. Secret fields reference either an exact SSM `SecureString` parameter
-with `valueFrom.ssmParameter` or an AWS Secrets Manager `SecretString` with
-`valueFrom.secretsManager`. Optional `jsonKey` selects one top-level string field from a JSON
-Secrets Manager value.
-
-A runtime role needs permissions equivalent to:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": "ssm:GetParametersByPath",
-      "Resource": [
-        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/upstreams/*",
-        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/relays/*",
-        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/brokers/*"
-      ]
-    },
-    {
-      "Effect": "Allow",
-      "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/secrets/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "secretsmanager:GetSecretValue",
-      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:oauthmux/*"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "kms:Decrypt",
-      "Resource": "arn:aws:kms:REGION:ACCOUNT:key/KEY_ID"
-    }
-  ]
-}
+```text
+crates/oauthmux-core/          protocol engine and embeddable router
+crates/oauthmux-provider-file/ File configuration provider
+crates/oauthmux-provider-ssm/  AWS SSM and Secrets Manager provider
+crates/oauthmux/               standalone native and Lambda runtime
 ```
 
-AWS region and credentials use the standard AWS SDK provider chain. When File and SSM contain the
-same resource kind and name, provider configuration order is deterministic: File is first, the
-collision is logged, and the File resource remains active.
-
-Run `oauthmux schema` to print the JSON Schema generated from the Rust resource types.
-
-## Runtime configuration
-
-| Variable | Meaning | Default |
-| --- | --- | --- |
-| `OAUTHMUX_PUBLIC_URL` | Externally visible absolute base URL | required |
-| `OAUTHMUX_SEAL_KEY` | `base64:`-prefixed or raw base64 32-byte key | required |
-| `OAUTHMUX_SEAL_KEY_PREVIOUS` | Previous 32-byte key accepted during rotation | unset |
-| `OAUTHMUX_LISTEN` | Native server socket | `0.0.0.0:8080` |
-| `OAUTHMUX_PROVIDER_FILE` | File provider YAML path | disabled |
-| `OAUTHMUX_PROVIDER_FILE_POLL` | File and referenced-secret reload interval | `30s` |
-| `OAUTHMUX_PROVIDER_SSM_PREFIX` | SSM hierarchy ending in `/` | disabled |
-| `OAUTHMUX_PROVIDER_SSM_POLL` | SSM poll interval | `60s` |
-| `OAUTHMUX_LAMBDA_CONFIG_TTL` | Maximum age before an invocation refreshes provider snapshots | `60s` |
-| `OAUTHMUX_LOG` | `tracing` filter | `info` |
-
-At least one provider must be enabled. Native mode exposes `/healthz` and reports `/readyz` only
-after every provider has produced its initial snapshot. It polls providers until SIGTERM or
-SIGINT and logs JSON when stdout is not a terminal.
-
-### Lambda container runtime
-
-The same image enters Lambda mode when `AWS_LAMBDA_RUNTIME_API` is present. Provider initialization
-is part of the cold start: all first snapshots, normally from SSM, are merged into the registry
-before the Lambda event loop starts. Before handling an invocation, oauthmux synchronously reloads
-provider snapshots when they are at least `OAUTHMUX_LAMBDA_CONFIG_TTL` old. Successful providers
-replace their snapshots; a failed provider retains its last valid snapshot. Invocation-driven
-refresh works across Lambda freezes and bounds configuration staleness without an SSM request on
-every invocation. The handler and native server use the same Axum router.
-
-Configure an API Gateway HTTP API or Lambda Function URL to forward every route to the image. Set
-`OAUTHMUX_PUBLIC_URL` to that external URL and give the function role the SSM/KMS permissions
-above. The Docker image contains the Lambda Runtime API client through the binary's default
-`lambda` feature; no Lambda base image or custom bootstrap is required.
-
-## Client authentication
-
-`Relay.spec.clientAuthentication.type` accepts:
-
-- `UpstreamClient`: application credentials must match the referenced upstream OAuth client.
-- `Public`: application PKCE is mandatory and only `S256` is accepted.
-- `ClientSecret`: `client_id` and `client_secret` form fields are checked in constant time.
-- `PrivateKeyJwt`: `client_id`, `client_assertion_type`, and `client_assertion` are required.
-  `jwks` is either an inline JWKS object or an HTTPS URL. The assertion issuer and subject equal
-  the client ID, its audience equals the relay's proxy token endpoint, and its signature and
-  expiration must validate.
-
-Redirect targets require an exact configured HTTP(S) origin. HTTP loopback targets on
-`localhost`, `127.0.0.1`, and `::1` are also valid for local development. Wildcards and URL-prefix
-matching are not used.
-
-## Transparent request relay
-
-The authorization endpoint forwards parameters it does not own, including `nonce`, `prompt`,
-`login_hint`, `access_type`, `hd`, and provider extensions. It replaces the upstream `client_id`,
-callback `redirect_uri`, sealed `state`, and PKCE fields, and constrains `response_type` to `code`.
-Only query response mode is supported. OIDC `request` and `request_uri` objects are rejected
-because their embedded routing fields cannot be safely reconciled with the proxy-owned values.
-
-The callback preserves upstream response extensions while replacing the upstream code and state
-with the sealed application code and original application state. Refresh requests preserve
-grant extensions and replace only downstream client authentication with the upstream client
-credentials. Token and refresh response status, content type, and body bytes remain unchanged.
-
-## Known gaps
-
-- `Broker` resources are rejected because brokered issuer execution is not implemented. Transparent relay requires a relying
-  party that supports manual endpoint configuration because standard OIDC discovery does not
-  allow a metadata URL hosted by oauthmux to identify the upstream issuer.
-- Brokered issuer requires upstream-token validation, downstream token issuance, an oauthmux-owned
-  JWKS, and UserInfo support.
-- Redirect trust policy supports origins only. It needs explicit matcher types for exact callback
-  URIs and constrained path templates whose placeholders match one path segment. Scheme, host,
-  and port remain exact; raw regular expressions and general URL wildcards are outside the policy
-  language.
-
-## Sealing, rotation, and replay
-
-Transient state and authorization codes are compact XChaCha20-Poly1305 envelopes. The current key
-seals all new envelopes. During a rotation, set the new key as `OAUTHMUX_SEAL_KEY` and retain the
-active key as `OAUTHMUX_SEAL_KEY_PREVIOUS` for at least ten minutes. Remove the previous key after
-all envelopes under it have expired. Key material and envelope plaintext are never logged.
-
-The standalone binary enables an in-memory replay cache. A code is single-use within one native
-replica or one warm Lambda execution environment. Without a `ReplayCache`, including an embedding
-that deliberately omits one, a sealed authorization code remains reusable for its five-minute
-lifetime. A distributed deployment that requires global single-use semantics must inject a
-shared `ReplayCache` implementation.
-
-Authorization codes carry the raw upstream token response through the application redirect.
-Responses that produce a sealed code larger than roughly 4 KB are logged because browser and
-intermediary URL limits can reject them.
-
-## Embedding
-
-`oauthmux-core` exports `ResourceResolver`, `MuxConfig`, `KeyStrategy`, and `router`. Resolution is
-performed for every request, so a database-backed host can expose live configuration directly.
-`KeyStrategy::TwoSegment` maps `/oidc/{project}/{extension}/...` to the relay key
-`{project}/{extension}`. The crate-level documentation contains a compiling HashMap-backed mount
-example.
+The core exposes resolver and replay-cache seams for hosts that need database-backed configuration
+or distributed single-use authorization codes.

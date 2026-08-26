@@ -21,12 +21,26 @@ export default defineConfig({
       ],
       sidebar: [
         {
+          label: 'Start here',
+          items: [{ label: 'Getting started', slug: 'getting-started' }],
+        },
+        {
           label: 'Concepts',
           items: [{ label: 'Operating modes', slug: 'modes' }],
         },
         {
           label: 'Guides',
           items: [{ autogenerate: { directory: 'guides' } }],
+        },
+        {
+          label: 'Reference',
+          items: [
+            { label: 'Configuration', slug: 'configuration' },
+            { label: 'File provider', slug: 'reference/file-provider' },
+            { label: 'AWS SSM provider', slug: 'reference/ssm-provider' },
+            { label: 'Runtime and deployment', slug: 'reference/runtime' },
+            { label: 'HTTP endpoints', slug: 'reference/http-endpoints' },
+          ],
         },
       ],
     }),

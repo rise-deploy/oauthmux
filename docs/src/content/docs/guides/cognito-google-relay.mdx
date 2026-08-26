@@ -70,7 +70,7 @@ Configure Google as the upstream and reference it from a relay that permits the 
 origin of every participating Cognito pool. `UpstreamClient` authentication checks the credentials
 each pool sends to oauthmux against the Google OAuth client credentials.
 
-```yaml
+```yaml oauthmux-config
 apiVersion: oauthmux.dev/v1alpha1
 kind: Upstream
 metadata:
@@ -125,7 +125,9 @@ clientSecret:
       name: /oauthmux/secrets/google-client-secret
 ```
 
-An AWS Secrets Manager reference with `secretId` and optional `jsonKey` is also supported.
+An AWS Secrets Manager reference with `secretId` and optional `jsonKey` is also supported. The
+[AWS SSM provider reference](/oauthmux/reference/ssm-provider/) describes the parameter layout,
+secret constraints, IAM permissions, and refresh behavior.
 
 oauthmux loads the initial snapshot during Lambda cold start. A warm execution environment checks
 the snapshot age before every invocation and synchronously reloads providers once it reaches
@@ -171,3 +173,6 @@ therefore validates the nonce, audience, issuer, and signature against the ident
 See the [Google OpenID Connect documentation](https://developers.google.com/identity/openid-connect/openid-connect)
 and [Cognito OIDC provider documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-oidc-idp.html)
 for the provider-side settings represented here.
+
+See [Configuration](/oauthmux/configuration/) for the complete `Upstream` and `Relay` field
+reference.

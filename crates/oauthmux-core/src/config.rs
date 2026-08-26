@@ -8,16 +8,21 @@ use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
+/// API version accepted by oauthmux resource documents.
 pub const API_VERSION: &str = "oauthmux.dev/v1alpha1";
 
+/// Returns the JSON Schema for one oauthmux resource document.
 pub fn resource_schema() -> schemars::Schema {
     schemars::schema_for!(ResourceDocument)
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
+/// A versioned oauthmux configuration resource.
 pub enum ResourceDocument {
+    /// An external OAuth/OIDC provider client and its stable callback.
     Upstream(UpstreamResource),
+    /// A transparent-relay policy that references an upstream.
     Relay(RelayResource),
 }
 
@@ -39,130 +44,182 @@ impl ResourceDocument {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// An external OAuth/OIDC provider connection.
 pub struct UpstreamResource {
+    /// Configuration API version. Must be `oauthmux.dev/v1alpha1`.
     #[serde(rename = "apiVersion")]
     pub api_version: ApiVersion,
+    /// Resource identity.
     pub metadata: Metadata,
+    /// Provider connection and OAuth client configuration.
     pub spec: UpstreamResourceSpec,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// A transparent relay that applies downstream policy to one upstream.
 pub struct RelayResource {
+    /// Configuration API version. Must be `oauthmux.dev/v1alpha1`.
     #[serde(rename = "apiVersion")]
     pub api_version: ApiVersion,
+    /// Resource identity.
     pub metadata: Metadata,
+    /// Upstream reference and transparent-relay policy.
     pub spec: RelayResourceSpec,
 }
 
 #[derive(Deserialize, JsonSchema)]
+/// Supported configuration API versions.
 pub enum ApiVersion {
+    /// Initial upstream and relay resource API.
     #[serde(rename = "oauthmux.dev/v1alpha1")]
     V1Alpha1,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+/// Common resource identity fields.
 pub struct Metadata {
+    /// URL-safe resource name containing ASCII letters, numbers, `.`, `_`, or `-`.
     pub name: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// External issuer, optional explicit endpoints, and provider OAuth client.
 pub struct UpstreamResourceSpec {
+    /// Absolute HTTP(S) issuer URL used for discovery and transparent token trust.
     pub issuer_url: String,
+    /// Explicit provider endpoints. Omitted endpoints are resolved through issuer discovery.
     #[serde(default)]
     pub endpoints: UpstreamEndpoints,
+    /// OAuth client registered with the external provider.
     pub oauth_client: OAuthClient,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Optional explicit provider endpoints.
 pub struct UpstreamEndpoints {
+    /// Absolute provider authorization endpoint.
     #[serde(default)]
     pub authorization: Option<String>,
+    /// Absolute provider token endpoint.
     #[serde(default)]
     pub token: Option<String>,
+    /// Absolute provider JSON Web Key Set endpoint.
     #[serde(default)]
     pub jwks: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// OAuth client registered with the external provider.
 pub struct OAuthClient {
+    /// Provider client identifier.
     pub client_id: String,
+    /// Provider client secret, supplied inline or through a provider-supported reference.
     pub client_secret: SecretValue,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Transparent-relay policy and upstream reference.
 pub struct RelayResourceSpec {
+    /// Upstream used for authorization and token exchange.
     pub upstream_ref: ResourceReference,
+    /// Default and allowed upstream scopes.
     #[serde(default)]
     pub scopes: ScopePolicy,
+    /// Authentication required at the relay token endpoint.
     pub client_authentication: ClientAuthentication,
+    /// Allowed application redirects and optional default redirect.
     #[serde(default)]
     pub redirect_policy: RedirectPolicy,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+/// Reference to another resource of the expected kind.
 pub struct ResourceReference {
+    /// Referenced resource name.
     pub name: String,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+/// Scopes applied to upstream authorization and refresh requests.
 pub struct ScopePolicy {
+    /// Scopes used when an authorization request omits `scope`.
     #[serde(default)]
     pub default: Vec<String>,
+    /// Complete allow-list for configured and requested scopes. Omission leaves scope policy to the upstream.
     #[serde(default)]
     pub allowed: Option<Vec<String>>,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Application redirect policy for a relay.
 pub struct RedirectPolicy {
+    /// Exact HTTP(S) origins allowed to receive authorization results.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Redirect URI used when an authorization request omits `redirect_uri`.
     #[serde(default)]
     pub default_redirect_uri: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(tag = "type", deny_unknown_fields)]
+/// Authentication accepted from a relying party at the relay token endpoint.
 pub enum ClientAuthentication {
+    /// Require the referenced upstream's OAuth client ID and secret.
     UpstreamClient,
+    /// Accept no client secret and require S256 PKCE for authorization-code flows.
     Public,
+    /// Require a relay-specific client ID and shared secret.
     ClientSecret {
+        /// Relay-specific downstream client identifier.
         #[serde(rename = "clientId")]
         client_id: String,
+        /// Relay-specific downstream client secret.
         #[serde(rename = "clientSecret")]
         client_secret: SecretValue,
     },
+    /// Require an RFC 7523 client assertion verified by a JWKS object or URL.
     PrivateKeyJwt {
+        /// Client identifier required as assertion issuer and subject.
         #[serde(rename = "clientId")]
         client_id: String,
+        /// Inline JWKS object or absolute HTTP(S) JWKS URL.
         jwks: serde_json::Value,
     },
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(untagged)]
+/// A secret supplied either inline or through exactly one external source.
 pub enum SecretValue {
+    /// Inline secret value.
     Value(InlineSecret),
+    /// Provider-resolved secret reference.
     ValueFrom(ReferencedSecret),
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+/// Inline secret representation supported by the File provider.
 pub struct InlineSecret {
+    /// Literal secret value.
     value: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// External secret reference.
 pub struct ReferencedSecret {
+    /// Exactly one provider-specific secret source.
     value_from: SecretSource,
 }
 
@@ -184,19 +241,29 @@ impl SecretValue {
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+/// Secret sources understood by the File and AWS SSM providers.
 pub enum SecretSource {
+    /// Environment variable resolved by the File provider.
     Env {
+        /// Environment variable name.
         name: String,
     },
+    /// Local file resolved by the File provider.
     File {
+        /// Absolute path or path relative to the resource file.
         path: String,
     },
+    /// Exact SSM SecureString parameter resolved by the AWS SSM provider.
     SsmParameter {
+        /// Absolute SSM parameter name.
         name: String,
     },
+    /// AWS Secrets Manager SecretString resolved by the AWS SSM provider.
     SecretsManager {
+        /// Secret name or ARN passed to Secrets Manager GetSecretValue.
         #[serde(rename = "secretId")]
         secret_id: String,
+        /// Optional top-level JSON string field selected from SecretString.
         #[serde(default, rename = "jsonKey")]
         json_key: Option<String>,
     },
@@ -488,5 +555,7 @@ mod tests {
         assert!(schema.contains("Relay"));
         assert!(schema.contains("secretsManager"));
         assert!(schema.contains("jsonKey"));
+        assert!(schema.contains("stable callback"));
+        assert!(schema.contains("Exact HTTP(S) origins"));
     }
 }

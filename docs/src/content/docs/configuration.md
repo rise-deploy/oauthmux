@@ -1,14 +1,13 @@
 ---
 title: Configuration
-description: Configure oauthmux resources and secret sources with the File or AWS SSM provider.
-sidebar:
-  order: 3
+description: Reference for oauthmux Upstream and Relay resources, policies, and secret values.
 ---
 
-oauthmux configuration is a stream of typed resources. Each document has an API version, a kind,
-a name, and a kind-specific specification:
+oauthmux configuration is a stream of strict, versioned resources. Each resource has an API
+version, kind, name, and kind-specific specification. Unknown fields, unsupported API versions,
+duplicate identities, and invalid references reject the complete candidate snapshot.
 
-```yaml
+```yaml oauthmux-config
 apiVersion: oauthmux.dev/v1alpha1
 kind: Upstream
 metadata:
@@ -45,25 +44,124 @@ spec:
 ```
 
 `Upstream` owns the external issuer, provider endpoints, OAuth client registration, credentials,
-and stable provider callback. `Relay` owns transparent-relay scopes, downstream client
-authentication, and redirect policy. Several relays can reference one upstream and therefore use
-the same provider callback:
+and stable provider callback. `Relay` owns transparent-relay scopes, downstream authentication,
+and redirect policy. Several relays can reference one upstream and use the same callback.
+
+## Common fields
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `apiVersion` | yes | Exactly `oauthmux.dev/v1alpha1`. |
+| `kind` | yes | `Upstream` or `Relay`. `Broker` is reserved but unavailable. |
+| `metadata.name` | yes | URL-safe resource name containing ASCII letters, numbers, `.`, `_`, or `-`. File and SSM resource names occupy one path segment. |
+
+An upstream and a relay may use the same name because identities include the resource kind.
+
+## Upstream
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `spec.issuerUrl` | yes | Absolute HTTP(S) issuer URL used for discovery and preserved as the transparent trust authority. |
+| `spec.endpoints.authorization` | no | Explicit upstream authorization endpoint. Discovery supplies it when omitted. |
+| `spec.endpoints.token` | no | Explicit upstream token endpoint. Discovery supplies it when omitted. |
+| `spec.endpoints.jwks` | no | Explicit upstream JWKS endpoint. Discovery supplies it when omitted. |
+| `spec.oauthClient.clientId` | yes | Provider OAuth client ID. |
+| `spec.oauthClient.clientSecret` | yes | Provider OAuth client secret as a [secret value](#secret-values). |
+
+The callback registered with the provider is derived from `OAUTHMUX_PUBLIC_URL` and the upstream
+name:
 
 ```text
 https://login.example.com/oidc/upstreams/google/callback
 ```
 
-Relay authorization and token endpoints use the relay name:
+Explicit endpoints are useful for providers without standard discovery. When authorization or
+token is omitted, oauthmux reads `{issuerUrl}/.well-known/openid-configuration`. The issuer and
+JWKS remain upstream-owned in transparent relay mode.
+
+## Relay
+
+| Field | Required | Default | Meaning |
+| --- | --- | --- | --- |
+| `spec.upstreamRef.name` | yes | — | Existing upstream used for authorization and token exchange. |
+| `spec.scopes.default` | no | `[]` | Scopes used when the authorization request omits `scope`. |
+| `spec.scopes.allowed` | no | unrestricted | Complete allow-list for configured and requested scopes. Every default scope must be allowed. |
+| `spec.clientAuthentication` | yes | — | Authentication policy for requests to the relay token endpoint. |
+| `spec.redirectPolicy.allowedOrigins` | no | `[]` | Exact HTTP(S) origins allowed to receive authorization results. |
+| `spec.redirectPolicy.defaultRedirectUri` | no | unset | Redirect used when authorization omits `redirect_uri`; its origin must be allowed. |
+
+Relay endpoints are derived from the relay name:
 
 ```text
 https://login.example.com/oidc/cognito-google/authorize
 https://login.example.com/oidc/cognito-google/token
 ```
 
-## File provider
+Allowed redirects match scheme, host, and effective port exactly. Paths are not part of an origin
+entry. HTTP loopback redirects on `localhost`, `127.0.0.1`, and `::1` are accepted for local
+development. User information, fragments, wildcards, and prefix matching are not accepted.
 
-Set `OAUTHMUX_PROVIDER_FILE` to a multi-document YAML file. A secret-bearing field accepts exactly
-one of an inline value, an environment source, or a file source:
+## Client authentication
+
+`spec.clientAuthentication` selects how a relying party authenticates to the relay token endpoint.
+
+### UpstreamClient
+
+The relying party presents the referenced upstream's client ID and secret. This is useful when a
+manually configured relying party, such as Cognito, already stores those credentials.
+
+```yaml
+clientAuthentication:
+  type: UpstreamClient
+```
+
+### Public
+
+No client secret is accepted. Every authorization-code flow must use S256 PKCE.
+
+```yaml
+clientAuthentication:
+  type: Public
+```
+
+### ClientSecret
+
+The relay has a distinct downstream client ID and secret. The secret supports the same provider-
+specific sources as the upstream client secret.
+
+```yaml
+clientAuthentication:
+  type: ClientSecret
+  clientId: relying-party
+  clientSecret:
+    valueFrom:
+      env:
+        name: RELAY_CLIENT_SECRET
+```
+
+### PrivateKeyJwt
+
+The relying party sends an RFC 7523 client assertion. `jwks` is either an HTTPS URL or an inline
+JWKS object with a non-empty `keys` array. The assertion issuer and subject must equal `clientId`,
+and its audience must equal the relay token endpoint.
+
+```yaml
+clientAuthentication:
+  type: PrivateKeyJwt
+  clientId: relying-party
+  jwks:
+    keys:
+      - kty: RSA
+        kid: relying-party-2026-01
+        use: sig
+        alg: RS256
+        n: base64url-modulus
+        e: AQAB
+```
+
+## Secret values
+
+A secret-bearing field contains exactly one inline value or one reference:
 
 ```yaml
 clientSecret:
@@ -84,43 +182,12 @@ clientSecret:
       path: ./secrets/google-client-secret
 ```
 
-Relative secret paths resolve from the configuration file's directory. Each provider refresh
-reloads the complete document stream and every referenced secret before publishing the snapshot.
-
-## AWS SSM provider
-
-Set `OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/`. The provider discovers full resource documents at
-fixed paths:
-
-```text
-/oauthmux/upstreams/google
-/oauthmux/relays/cognito-google
-/oauthmux/brokers/workforce
-```
-
-`Upstream` and `Relay` parameters use the SSM `String` type. The path kind and name must match the
-document's `kind` and `metadata.name`. `Broker` is a reserved path kind and is rejected until
-brokered issuer mode is available.
-
-An SSM resource document references a separate `SecureString` parameter by its absolute name:
-
 ```yaml
 clientSecret:
   valueFrom:
     ssmParameter:
       name: /oauthmux/secrets/google-client-secret
 ```
-
-It can instead reference an AWS Secrets Manager `SecretString`:
-
-```yaml
-clientSecret:
-  valueFrom:
-    secretsManager:
-      secretId: oauthmux/google
-```
-
-`jsonKey` selects one top-level string field from a JSON `SecretString`:
 
 ```yaml
 clientSecret:
@@ -130,22 +197,25 @@ clientSecret:
       jsonKey: clientSecret
 ```
 
-Without `jsonKey`, the complete `SecretString` is used. Binary secrets, nested paths, missing
-fields, and non-string selected values are rejected. Every refresh fetches the current secret
-values; a failure retains the complete last-good snapshot.
+The active configuration provider determines which sources are accepted:
 
-The runtime role needs `ssm:GetParametersByPath` for the resource paths, `ssm:GetParameter` for
-referenced SSM secrets, `secretsmanager:GetSecretValue` for referenced Secrets Manager secrets,
-and `kms:Decrypt` when a customer-managed key protects either source.
+| Provider | Accepted secret forms |
+| --- | --- |
+| [File](/oauthmux/reference/file-provider/) | `value`, `valueFrom.env`, `valueFrom.file` |
+| [AWS SSM](/oauthmux/reference/ssm-provider/) | `valueFrom.ssmParameter`, `valueFrom.secretsManager` |
+
+Identical references are resolved once while compiling a candidate snapshot. Resolved values have
+a redacted debug representation and are not included in configuration errors.
 
 ## JSON Schema
 
-The executable generates the schema directly from the Rust configuration types:
+Generate the schema directly from the Rust configuration types:
 
 ```console
 oauthmux schema > oauthmux.schema.json
 ```
 
 The schema describes one resource document; a File provider configuration is a YAML stream of
-those documents. The documentation publishes the current
-[oauthmux JSON Schema](/oauthmux/oauthmux.schema.json).
+those documents. The published [oauthmux JSON Schema](/oauthmux/oauthmux.schema.json) includes
+field descriptions, strict unions, and the exact API version. CI checks that it remains synchronized
+with the Rust types.

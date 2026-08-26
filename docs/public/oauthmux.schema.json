@@ -1,11 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ResourceDocument",
+  "description": "A versioned oauthmux configuration resource.",
   "oneOf": [
     {
+      "description": "An external OAuth/OIDC provider client and its stable callback.",
       "type": "object",
       "properties": {
         "apiVersion": {
+          "description": "Configuration API version. Must be `oauthmux.dev/v1alpha1`.",
           "$ref": "#/$defs/ApiVersion"
         },
         "kind": {
@@ -13,9 +16,11 @@
           "const": "Upstream"
         },
         "metadata": {
+          "description": "Resource identity.",
           "$ref": "#/$defs/Metadata"
         },
         "spec": {
+          "description": "Provider connection and OAuth client configuration.",
           "$ref": "#/$defs/UpstreamResourceSpec"
         }
       },
@@ -28,9 +33,11 @@
       ]
     },
     {
+      "description": "A transparent-relay policy that references an upstream.",
       "type": "object",
       "properties": {
         "apiVersion": {
+          "description": "Configuration API version. Must be `oauthmux.dev/v1alpha1`.",
           "$ref": "#/$defs/ApiVersion"
         },
         "kind": {
@@ -38,9 +45,11 @@
           "const": "Relay"
         },
         "metadata": {
+          "description": "Resource identity.",
           "$ref": "#/$defs/Metadata"
         },
         "spec": {
+          "description": "Upstream reference and transparent-relay policy.",
           "$ref": "#/$defs/RelayResourceSpec"
         }
       },
@@ -55,14 +64,20 @@
   ],
   "$defs": {
     "ApiVersion": {
-      "type": "string",
-      "enum": [
-        "oauthmux.dev/v1alpha1"
+      "description": "Supported configuration API versions.",
+      "oneOf": [
+        {
+          "description": "Initial upstream and relay resource API.",
+          "type": "string",
+          "const": "oauthmux.dev/v1alpha1"
+        }
       ]
     },
     "ClientAuthentication": {
+      "description": "Authentication accepted from a relying party at the relay token endpoint.",
       "oneOf": [
         {
+          "description": "Require the referenced upstream's OAuth client ID and secret.",
           "type": "object",
           "properties": {
             "type": {
@@ -76,6 +91,7 @@
           ]
         },
         {
+          "description": "Accept no client secret and require S256 PKCE for authorization-code flows.",
           "type": "object",
           "properties": {
             "type": {
@@ -89,12 +105,15 @@
           ]
         },
         {
+          "description": "Require a relay-specific client ID and shared secret.",
           "type": "object",
           "properties": {
             "clientId": {
+              "description": "Relay-specific downstream client identifier.",
               "type": "string"
             },
             "clientSecret": {
+              "description": "Relay-specific downstream client secret.",
               "$ref": "#/$defs/SecretValue"
             },
             "type": {
@@ -110,12 +129,16 @@
           ]
         },
         {
+          "description": "Require an RFC 7523 client assertion verified by a JWKS object or URL.",
           "type": "object",
           "properties": {
             "clientId": {
+              "description": "Client identifier required as assertion issuer and subject.",
               "type": "string"
             },
-            "jwks": true,
+            "jwks": {
+              "description": "Inline JWKS object or absolute HTTP(S) JWKS URL."
+            },
             "type": {
               "type": "string",
               "const": "PrivateKeyJwt"
@@ -131,9 +154,11 @@
       ]
     },
     "InlineSecret": {
+      "description": "Inline secret representation supported by the File provider.",
       "type": "object",
       "properties": {
         "value": {
+          "description": "Literal secret value.",
           "type": "string"
         }
       },
@@ -143,9 +168,11 @@
       ]
     },
     "Metadata": {
+      "description": "Common resource identity fields.",
       "type": "object",
       "properties": {
         "name": {
+          "description": "URL-safe resource name containing ASCII letters, numbers, `.`, `_`, or `-`.",
           "type": "string"
         }
       },
@@ -155,12 +182,15 @@
       ]
     },
     "OAuthClient": {
+      "description": "OAuth client registered with the external provider.",
       "type": "object",
       "properties": {
         "clientId": {
+          "description": "Provider client identifier.",
           "type": "string"
         },
         "clientSecret": {
+          "description": "Provider client secret, supplied inline or through a provider-supported reference.",
           "$ref": "#/$defs/SecretValue"
         }
       },
@@ -171,9 +201,11 @@
       ]
     },
     "RedirectPolicy": {
+      "description": "Application redirect policy for a relay.",
       "type": "object",
       "properties": {
         "allowedOrigins": {
+          "description": "Exact HTTP(S) origins allowed to receive authorization results.",
           "type": "array",
           "default": [],
           "items": {
@@ -181,6 +213,7 @@
           }
         },
         "defaultRedirectUri": {
+          "description": "Redirect URI used when an authorization request omits `redirect_uri`.",
           "type": [
             "string",
             "null"
@@ -191,9 +224,11 @@
       "additionalProperties": false
     },
     "ReferencedSecret": {
+      "description": "External secret reference.",
       "type": "object",
       "properties": {
         "valueFrom": {
+          "description": "Exactly one provider-specific secret source.",
           "$ref": "#/$defs/SecretSource"
         }
       },
@@ -203,18 +238,23 @@
       ]
     },
     "RelayResourceSpec": {
+      "description": "Transparent-relay policy and upstream reference.",
       "type": "object",
       "properties": {
         "clientAuthentication": {
+          "description": "Authentication required at the relay token endpoint.",
           "$ref": "#/$defs/ClientAuthentication"
         },
         "redirectPolicy": {
+          "description": "Allowed application redirects and optional default redirect.",
           "$ref": "#/$defs/RedirectPolicy"
         },
         "scopes": {
+          "description": "Default and allowed upstream scopes.",
           "$ref": "#/$defs/ScopePolicy"
         },
         "upstreamRef": {
+          "description": "Upstream used for authorization and token exchange.",
           "$ref": "#/$defs/ResourceReference"
         }
       },
@@ -225,9 +265,11 @@
       ]
     },
     "ResourceReference": {
+      "description": "Reference to another resource of the expected kind.",
       "type": "object",
       "properties": {
         "name": {
+          "description": "Referenced resource name.",
           "type": "string"
         }
       },
@@ -237,9 +279,11 @@
       ]
     },
     "ScopePolicy": {
+      "description": "Scopes applied to upstream authorization and refresh requests.",
       "type": "object",
       "properties": {
         "allowed": {
+          "description": "Complete allow-list for configured and requested scopes. Omission leaves scope policy to the upstream.",
           "type": [
             "array",
             "null"
@@ -250,6 +294,7 @@
           }
         },
         "default": {
+          "description": "Scopes used when an authorization request omits `scope`.",
           "type": "array",
           "default": [],
           "items": {
@@ -260,14 +305,17 @@
       "additionalProperties": false
     },
     "SecretSource": {
+      "description": "Secret sources understood by the File and AWS SSM providers.",
       "oneOf": [
         {
+          "description": "Environment variable resolved by the File provider.",
           "type": "object",
           "properties": {
             "env": {
               "type": "object",
               "properties": {
                 "name": {
+                  "description": "Environment variable name.",
                   "type": "string"
                 }
               },
@@ -283,12 +331,14 @@
           ]
         },
         {
+          "description": "Local file resolved by the File provider.",
           "type": "object",
           "properties": {
             "file": {
               "type": "object",
               "properties": {
                 "path": {
+                  "description": "Absolute path or path relative to the resource file.",
                   "type": "string"
                 }
               },
@@ -304,12 +354,14 @@
           ]
         },
         {
+          "description": "Exact SSM SecureString parameter resolved by the AWS SSM provider.",
           "type": "object",
           "properties": {
             "ssmParameter": {
               "type": "object",
               "properties": {
                 "name": {
+                  "description": "Absolute SSM parameter name.",
                   "type": "string"
                 }
               },
@@ -325,12 +377,14 @@
           ]
         },
         {
+          "description": "AWS Secrets Manager SecretString resolved by the AWS SSM provider.",
           "type": "object",
           "properties": {
             "secretsManager": {
               "type": "object",
               "properties": {
                 "jsonKey": {
+                  "description": "Optional top-level JSON string field selected from SecretString.",
                   "type": [
                     "string",
                     "null"
@@ -338,6 +392,7 @@
                   "default": null
                 },
                 "secretId": {
+                  "description": "Secret name or ARN passed to Secrets Manager GetSecretValue.",
                   "type": "string"
                 }
               },
@@ -355,19 +410,24 @@
       ]
     },
     "SecretValue": {
+      "description": "A secret supplied either inline or through exactly one external source.",
       "anyOf": [
         {
+          "description": "Inline secret value.",
           "$ref": "#/$defs/InlineSecret"
         },
         {
+          "description": "Provider-resolved secret reference.",
           "$ref": "#/$defs/ReferencedSecret"
         }
       ]
     },
     "UpstreamEndpoints": {
+      "description": "Optional explicit provider endpoints.",
       "type": "object",
       "properties": {
         "authorization": {
+          "description": "Absolute provider authorization endpoint.",
           "type": [
             "string",
             "null"
@@ -375,6 +435,7 @@
           "default": null
         },
         "jwks": {
+          "description": "Absolute provider JSON Web Key Set endpoint.",
           "type": [
             "string",
             "null"
@@ -382,6 +443,7 @@
           "default": null
         },
         "token": {
+          "description": "Absolute provider token endpoint.",
           "type": [
             "string",
             "null"
@@ -392,15 +454,19 @@
       "additionalProperties": false
     },
     "UpstreamResourceSpec": {
+      "description": "External issuer, optional explicit endpoints, and provider OAuth client.",
       "type": "object",
       "properties": {
         "endpoints": {
+          "description": "Explicit provider endpoints. Omitted endpoints are resolved through issuer discovery.",
           "$ref": "#/$defs/UpstreamEndpoints"
         },
         "issuerUrl": {
+          "description": "Absolute HTTP(S) issuer URL used for discovery and transparent token trust.",
           "type": "string"
         },
         "oauthClient": {
+          "description": "OAuth client registered with the external provider.",
           "$ref": "#/$defs/OAuthClient"
         }
       },

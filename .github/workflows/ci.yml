@@ -10,29 +10,57 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - name: Mount Cargo build cache
+        uses: useblacksmith/stickydisk@v1
+        with:
+          key: cargo-target-rust-1-97-1-${{ runner.arch }}
+          path: target
+      - name: Cache Cargo downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-downloads-${{ runner.os }}-${{ runner.arch }}-
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
 
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - uses: useblacksmith/setup-docker-builder@v1
+        with:
+          max-cache-size-mb: "10240"
       - run: mise run e2e
 
   image:
-    runs-on: ubuntu-latest
+    name: image (${{ matrix.architecture }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: amd64
+            runner: blacksmith-8vcpu-ubuntu-2404
+            platform: linux/amd64
+          - architecture: arm64
+            runner: blacksmith-8vcpu-ubuntu-2404-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: actions/checkout@v6
+      - uses: useblacksmith/setup-docker-builder@v1
+        with:
+          max-cache-size-mb: "10240"
+      - uses: useblacksmith/build-push-action@v2
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           push: false

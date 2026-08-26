@@ -111,8 +111,7 @@ spec:
   clientAuthentication:
     type: Public
   redirectPolicy:
-    allowedOrigins: [http://127.0.0.1:19090]
-    defaultRedirectUri: {APP_CALLBACK}
+    - uri: {APP_CALLBACK}
 "#
         ),
     )

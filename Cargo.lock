@@ -1880,13 +1880,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "oauthmux-core",
+ "oauthmux-secret-resolver",
  "serde",
- "serde_json",
  "serde_yaml",
  "tempfile",
  "tokio",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -1898,12 +1897,23 @@ dependencies = [
  "aws-sdk-secretsmanager",
  "aws-sdk-ssm",
  "oauthmux-core",
+ "oauthmux-secret-resolver",
  "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
  "tracing",
- "url",
+]
+
+[[package]]
+name = "oauthmux-secret-resolver"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "oauthmux-core",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

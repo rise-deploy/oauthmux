@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/oauthmux-core",
+  "crates/oauthmux-secret-resolver",
   "crates/oauthmux-provider-file",
   "crates/oauthmux-provider-ssm",
   "crates/oauthmux",

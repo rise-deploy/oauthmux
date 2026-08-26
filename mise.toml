@@ -10,6 +10,7 @@ run = [
   "actionlint",
   "cargo fmt --all -- --check",
   "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  "mise run features:check",
   "cargo test --workspace --all-features",
   "mise run schema:check",
   "mise run docs",
@@ -27,6 +28,14 @@ run = "cargo run -q -p oauthmux -- schema > docs/public/oauthmux.schema.json"
 [tasks."schema:check"]
 description = "Check the generated oauthmux configuration schema"
 run = "cargo run -q -p oauthmux -- schema | diff -u docs/public/oauthmux.schema.json -"
+
+[tasks."features:check"]
+description = "Check standalone binary feature combinations"
+run = [
+  "cargo check -p oauthmux --no-default-features",
+  "cargo check -p oauthmux --no-default-features --features aws",
+  "cargo check -p oauthmux --no-default-features --features lambda",
+]
 
 [tasks."docs:serve"]
 description = "Serve the documentation site locally"

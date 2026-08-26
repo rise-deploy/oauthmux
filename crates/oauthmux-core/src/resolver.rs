@@ -158,7 +158,7 @@ impl ResourceResolver for ProviderSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClientAuth, SecretString};
+    use crate::{ClientAuth, RedirectMatcher, SecretString};
     use url::Url;
 
     fn upstream(key: &str) -> Arc<Upstream> {
@@ -180,8 +180,7 @@ mod tests {
             client_auth: ClientAuth::Public,
             scopes: vec![],
             allowed_scopes: None,
-            allowed_redirect_origins: vec![],
-            default_redirect_uri: None,
+            redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
         })
     }
 

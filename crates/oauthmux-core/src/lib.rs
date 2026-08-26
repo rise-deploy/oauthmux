@@ -12,6 +12,7 @@
 //!     sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
 //!     replay_cache: None,
 //!     http: reqwest::Client::new(),
+//!     allow_localhost_loopback: false,
 //! };
 //! let app = router(Arc::new(resources), config, KeyStrategy::TwoSegment);
 //! let _host = axum::Router::new().nest("/", app);

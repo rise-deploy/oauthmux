@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Context};
+#[cfg(feature = "aws")]
+use async_trait::async_trait;
 #[cfg(feature = "lambda")]
 use axum::{
     extract::{Request, State},
@@ -11,8 +13,13 @@ use oauthmux_core::{
     resource_schema, router, ConfigProvider, KeyStrategy, MemoryReplayCache, MuxConfig,
     ProviderSnapshot, Registry, XChaChaSealer,
 };
+#[cfg(feature = "aws")]
+use oauthmux_core::{SecretResolver, SecretSource, SecretString};
 use oauthmux_provider_file::FileProvider;
-use oauthmux_provider_ssm::{AwsSecretsManagerClient, AwsSsmClient, SsmProvider};
+#[cfg(feature = "aws")]
+use oauthmux_provider_ssm::{
+    AwsSecretResolver, AwsSecretsManagerClient, AwsSsmClient, SsmProvider,
+};
 #[cfg(feature = "lambda")]
 use std::time::SystemTime;
 use std::{
@@ -59,6 +66,38 @@ struct LambdaConfigRefresher {
     state: Mutex<LambdaRefreshState>,
 }
 
+#[cfg(feature = "aws")]
+#[derive(Default)]
+struct LazyAwsSecretResolver {
+    resolver: tokio::sync::OnceCell<AwsSecretResolver<AwsSsmClient, AwsSecretsManagerClient>>,
+}
+
+#[cfg(feature = "aws")]
+#[async_trait]
+impl SecretResolver for LazyAwsSecretResolver {
+    async fn resolve_value(&self, _: &str) -> anyhow::Result<SecretString> {
+        Err(anyhow!(
+            "inline values are resolved by StandardSecretResolver"
+        ))
+    }
+
+    async fn resolve_source(&self, source: &SecretSource) -> anyhow::Result<SecretString> {
+        let resolver = self
+            .resolver
+            .get_or_try_init(|| async {
+                let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                Ok::<_, anyhow::Error>(AwsSecretResolver::new(
+                    Arc::new(AwsSsmClient(aws_sdk_ssm_client(&config))),
+                    Arc::new(AwsSecretsManagerClient(
+                        aws_sdk_secretsmanager::Client::new(&config),
+                    )),
+                ))
+            })
+            .await?;
+        resolver.resolve_source(source).await
+    }
+}
+
 #[cfg(feature = "lambda")]
 const DEFAULT_LAMBDA_CONFIG_TTL: Duration = Duration::from_secs(60);
 
@@ -91,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
             sealer,
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::builder().build()?,
+            allow_localhost_loopback: bool_env("OAUTHMUX_ALLOW_LOCALHOST_LOOPBACK", false)?,
         },
         KeyStrategy::SingleSegment,
     );
@@ -148,28 +188,51 @@ async fn main() -> anyhow::Result<()> {
 
 async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> {
     let mut providers: Vec<Arc<dyn ConfigProvider>> = Vec::new();
-    if let Ok(path) = env::var("OAUTHMUX_PROVIDER_FILE") {
-        providers.push(Arc::new(FileProvider::new(
+    let file_path = env::var("OAUTHMUX_PROVIDER_FILE").ok();
+    let ssm_prefix = env::var("OAUTHMUX_PROVIDER_SSM_PREFIX").ok();
+
+    #[cfg(feature = "aws")]
+    let aws_clients = if ssm_prefix.is_some() {
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        Some((
+            Arc::new(AwsSsmClient(aws_sdk_ssm_client(&config))),
+            Arc::new(AwsSecretsManagerClient(
+                aws_sdk_secretsmanager::Client::new(&config),
+            )),
+        ))
+    } else {
+        None
+    };
+
+    if let Some(path) = file_path {
+        let provider = FileProvider::new(
             path,
             duration_env("OAUTHMUX_PROVIDER_FILE_POLL", Duration::from_secs(30))?,
-        )?));
+        )?;
+        #[cfg(feature = "aws")]
+        let provider = provider.with_aws_secrets(Arc::new(LazyAwsSecretResolver::default()));
+        providers.push(Arc::new(provider));
     }
-    if let Ok(prefix) = env::var("OAUTHMUX_PROVIDER_SSM_PREFIX") {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = Arc::new(AwsSsmClient(aws_sdk_ssm_client(&config)));
-        let secrets_manager = Arc::new(AwsSecretsManagerClient(
-            aws_sdk_secretsmanager::Client::new(&config),
-        ));
+    #[cfg(feature = "aws")]
+    if let Some(prefix) = ssm_prefix {
+        let (ssm, secrets_manager) = aws_clients.as_ref().expect("AWS clients initialized");
         providers.push(Arc::new(SsmProvider::new(
-            client,
-            secrets_manager,
+            ssm.clone(),
+            secrets_manager.clone(),
             prefix,
             duration_env("OAUTHMUX_PROVIDER_SSM_POLL", Duration::from_secs(60))?,
         )?));
     }
+    #[cfg(not(feature = "aws"))]
+    if ssm_prefix.is_some() {
+        return Err(anyhow!(
+            "OAUTHMUX_PROVIDER_SSM_PREFIX requires the oauthmux aws feature"
+        ));
+    }
     Ok(providers)
 }
 
+#[cfg(feature = "aws")]
 fn aws_sdk_ssm_client(config: &aws_config::SdkConfig) -> aws_sdk_ssm::Client {
     aws_sdk_ssm::Client::new(config)
 }
@@ -348,6 +411,19 @@ fn duration_env(name: &str, default: Duration) -> anyhow::Result<Duration> {
     parse_duration(name, &value)
 }
 
+fn bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
+    let Ok(value) = env::var(name) else {
+        return Ok(default);
+    };
+    parse_bool(name, &value)
+}
+
+fn parse_bool(name: &str, value: &str) -> anyhow::Result<bool> {
+    value
+        .parse()
+        .with_context(|| format!("{name} must be true or false"))
+}
+
 fn parse_duration(name: &str, value: &str) -> anyhow::Result<Duration> {
     let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
         (value, 1_u64)
@@ -402,7 +478,7 @@ mod tests {
     #[cfg(feature = "lambda")]
     use async_trait::async_trait;
     #[cfg(feature = "lambda")]
-    use oauthmux_core::{ClientAuth, Relay, ResourceKey, SecretString, Upstream};
+    use oauthmux_core::{ClientAuth, RedirectMatcher, Relay, ResourceKey, SecretString, Upstream};
 
     #[cfg(feature = "lambda")]
     use std::sync::atomic::AtomicUsize;
@@ -430,8 +506,7 @@ mod tests {
             client_auth: ClientAuth::Public,
             scopes: vec![],
             allowed_scopes: None,
-            allowed_redirect_origins: vec![],
-            default_redirect_uri: None,
+            redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
         });
         let mut snapshot = ProviderSnapshot::default();
         snapshot.upstreams.insert(key.clone(), upstream);
@@ -467,6 +542,9 @@ mod tests {
             Duration::from_secs(2)
         );
         assert!(parse_duration("TEST", "0s").is_err());
+        assert!(parse_bool("TEST", "true").unwrap());
+        assert!(!parse_bool("TEST", "false").unwrap());
+        assert!(parse_bool("TEST", "yes").is_err());
     }
 
     #[cfg(feature = "lambda")]

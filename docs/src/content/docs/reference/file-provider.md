@@ -1,10 +1,12 @@
 ---
 title: File provider
-description: Load oauthmux resources and local secret references from a YAML document stream.
+description: Load oauthmux resources from a YAML document stream.
 ---
 
 The File provider reads a multi-document YAML stream from one path. It is suitable for native
-servers, mounted container configuration, and development environments.
+servers, mounted container configuration, and development environments. Secret values may remain
+local or reference AWS Parameter Store and Secrets Manager independently of where the resource
+document is stored.
 
 ## Enable the provider
 
@@ -46,8 +48,7 @@ spec:
   clientAuthentication:
     type: Public
   redirectPolicy:
-    allowedOrigins:
-      - https://app.example.com
+    - uri: https://app.example.com/oauth/callback
 ```
 
 Relative secret paths resolve from the resource file's directory. Referenced environment and file
@@ -77,9 +78,28 @@ clientSecret:
       path: ./secrets/provider-client-secret
 ```
 
-SSM Parameter Store and Secrets Manager references are rejected by this provider. Use the
-[AWS SSM provider](/oauthmux/reference/ssm-provider/) when configuration should resolve AWS-backed
-secrets.
+```yaml
+clientSecret:
+  valueFrom:
+    awsSsmParameter:
+      name: /oauthmux/secrets/provider-client-secret
+```
+
+```yaml
+clientSecret:
+  valueFrom:
+    awsSecretsManager:
+      secretId: oauthmux/provider
+      jsonKey: clientSecret
+```
+
+The File and SSM providers use the same standard resolver. The standalone binary's default `aws`
+feature supplies the AWS resolver and standard AWS SDK credential, region, and endpoint chain.
+Embeddings inject the resolver with
+`FileProvider::with_aws_secrets`. Without an AWS resolver, AWS references reject the candidate
+snapshot. The [AWS SSM provider reference](/oauthmux/reference/ssm-provider/) documents secret
+validation and the relevant `GetParameter`, `GetSecretValue`, and KMS permissions; those
+requirements also apply when the resource document comes from a file.
 
 ## Reload behavior
 

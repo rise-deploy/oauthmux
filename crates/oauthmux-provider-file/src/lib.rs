@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use oauthmux_core::{
     compile_resources, ConfigProvider, ProviderSnapshot, ResourceDocument, SecretResolver,
-    SecretSource, SecretString,
 };
+use oauthmux_secret_resolver::{LocalSecrets, StandardSecretResolver, SystemLocalSecrets};
 use serde::Deserialize;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::watch;
@@ -11,27 +11,11 @@ use tokio::sync::watch;
 pub const DEFAULT_PATH: &str = "/etc/oauthmux/config.yaml";
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-trait LocalSecrets: Send + Sync {
-    fn environment(&self, name: &str) -> anyhow::Result<String>;
-    fn file(&self, path: &std::path::Path) -> anyhow::Result<String>;
-}
-
-struct SystemLocalSecrets;
-
-impl LocalSecrets for SystemLocalSecrets {
-    fn environment(&self, name: &str) -> anyhow::Result<String> {
-        std::env::var(name).with_context(|| format!("environment variable {name} is not set"))
-    }
-
-    fn file(&self, path: &std::path::Path) -> anyhow::Result<String> {
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
-    }
-}
-
 pub struct FileProvider {
     path: PathBuf,
     poll_interval: Duration,
-    secrets: Arc<dyn LocalSecrets>,
+    local_secrets: Arc<dyn LocalSecrets>,
+    aws_secrets: Option<Arc<dyn SecretResolver>>,
 }
 
 impl Default for FileProvider {
@@ -39,7 +23,8 @@ impl Default for FileProvider {
         Self {
             path: DEFAULT_PATH.into(),
             poll_interval: DEFAULT_POLL_INTERVAL,
-            secrets: Arc::new(SystemLocalSecrets),
+            local_secrets: Arc::new(SystemLocalSecrets),
+            aws_secrets: None,
         }
     }
 }
@@ -54,8 +39,21 @@ impl FileProvider {
         Ok(Self {
             path: path.into(),
             poll_interval,
-            secrets: Arc::new(SystemLocalSecrets),
+            local_secrets: Arc::new(SystemLocalSecrets),
+            aws_secrets: None,
         })
+    }
+
+    /// Supplies environment and filesystem access to the standard secret resolver.
+    pub fn with_local_secrets(mut self, local_secrets: Arc<dyn LocalSecrets>) -> Self {
+        self.local_secrets = local_secrets;
+        self
+    }
+
+    /// Supplies AWS-backed resolution for `awsSsmParameter` and `awsSecretsManager` references.
+    pub fn with_aws_secrets(mut self, resolver: Arc<dyn SecretResolver>) -> Self {
+        self.aws_secrets = Some(resolver);
+        self
     }
 
     pub async fn load(&self) -> anyhow::Result<ProviderSnapshot> {
@@ -63,13 +61,16 @@ impl FileProvider {
             .await
             .with_context(|| format!("read {}", self.path.display()))?;
         let documents = parse_documents(&contents)?;
-        let resolver = FileSecretResolver {
-            base: self
-                .path
+        let mut resolver = StandardSecretResolver::new(Some(
+            self.path
                 .parent()
-                .unwrap_or_else(|| std::path::Path::new(".")),
-            secrets: self.secrets.as_ref(),
-        };
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_owned(),
+        ))
+        .with_local_secrets(self.local_secrets.clone());
+        if let Some(aws) = &self.aws_secrets {
+            resolver = resolver.with_aws_secrets(aws.clone());
+        }
         compile_resources(documents, &resolver).await
     }
 }
@@ -111,42 +112,10 @@ fn parse_documents(yaml: &str) -> anyhow::Result<Vec<ResourceDocument>> {
         .collect()
 }
 
-struct FileSecretResolver<'a> {
-    base: &'a std::path::Path,
-    secrets: &'a dyn LocalSecrets,
-}
-
-#[async_trait]
-impl SecretResolver for FileSecretResolver<'_> {
-    async fn resolve_value(&self, value: &str) -> anyhow::Result<SecretString> {
-        Ok(SecretString::new(value))
-    }
-
-    async fn resolve_source(&self, source: &SecretSource) -> anyhow::Result<SecretString> {
-        let value = match source {
-            SecretSource::Env { name } => self.secrets.environment(name)?,
-            SecretSource::File { path } => {
-                let path = PathBuf::from(path);
-                let path = if path.is_absolute() {
-                    path
-                } else {
-                    self.base.join(path)
-                };
-                self.secrets.file(&path)?
-            }
-            SecretSource::SsmParameter { .. } | SecretSource::SecretsManager { .. } => {
-                return Err(anyhow!(
-                    "AWS secret sources are not supported by the File provider"
-                ))
-            }
-        };
-        Ok(SecretString::new(value.trim_end_matches(['\r', '\n'])))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oauthmux_core::{SecretSource, SecretString};
     use std::{collections::HashMap, sync::Mutex};
     use tempfile::NamedTempFile;
 
@@ -178,6 +147,28 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct MockAwsSecrets {
+        calls: Mutex<Vec<SecretSource>>,
+    }
+
+    #[async_trait]
+    impl SecretResolver for MockAwsSecrets {
+        async fn resolve_value(&self, _: &str) -> anyhow::Result<SecretString> {
+            unreachable!("StandardSecretResolver handles inline values")
+        }
+
+        async fn resolve_source(&self, source: &SecretSource) -> anyhow::Result<SecretString> {
+            self.calls.lock().unwrap().push(source.clone());
+            let value = match source {
+                SecretSource::AwsSsmParameter { .. } => "from-ssm",
+                SecretSource::AwsSecretsManager { .. } => "from-secrets-manager",
+                _ => unreachable!("only AWS sources are delegated"),
+            };
+            Ok(SecretString::new(value))
+        }
+    }
+
     fn yaml(secret: &str) -> String {
         format!(
             r#"apiVersion: oauthmux.dev/v1alpha1
@@ -201,7 +192,7 @@ spec:
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
-    allowedOrigins: [https://app.example]
+    - uri: https://app.example/callback
 "#
         )
     }
@@ -209,11 +200,9 @@ spec:
     async fn load_with(secret: &str, secrets: Arc<dyn LocalSecrets>) -> ProviderSnapshot {
         let file = NamedTempFile::new().unwrap();
         std::fs::write(file.path(), yaml(secret)).unwrap();
-        let provider = FileProvider {
-            path: file.path().to_owned(),
-            poll_interval: Duration::from_secs(1),
-            secrets,
-        };
+        let provider = FileProvider::new(file.path(), Duration::from_secs(1))
+            .unwrap()
+            .with_local_secrets(secrets);
         provider.load().await.unwrap()
     }
 
@@ -281,10 +270,10 @@ spec:
     }
 
     #[tokio::test]
-    async fn rejects_aws_secret_sources() {
+    async fn requires_aws_secret_resolution_for_aws_sources() {
         for secret in [
-            "      valueFrom:\n        ssmParameter:\n          name: /secret",
-            "      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
+            "      valueFrom:\n        awsSsmParameter:\n          name: /secret",
+            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
         ] {
             let file = NamedTempFile::new().unwrap();
             std::fs::write(file.path(), yaml(secret)).unwrap();
@@ -295,6 +284,48 @@ spec:
                 .unwrap_err()
                 .to_string()
                 .contains("Upstream/google"));
+        }
+    }
+
+    #[tokio::test]
+    async fn delegates_aws_secret_sources() {
+        let cases = [
+            (
+                "      valueFrom:\n        awsSsmParameter:\n          name: /secret",
+                SecretSource::AwsSsmParameter {
+                    name: "/secret".into(),
+                },
+                "from-ssm",
+            ),
+            (
+                "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
+                SecretSource::AwsSecretsManager {
+                    secret_id: "oauthmux/google".into(),
+                    json_key: Some("clientSecret".into()),
+                },
+                "from-secrets-manager",
+            ),
+        ];
+
+        for (secret, expected_source, expected_value) in cases {
+            let file = NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), yaml(secret)).unwrap();
+            let aws = Arc::new(MockAwsSecrets::default());
+            let provider = FileProvider::new(file.path(), Duration::from_secs(1))
+                .unwrap()
+                .with_aws_secrets(aws.clone());
+            let snapshot = provider.load().await.unwrap();
+            assert_eq!(
+                snapshot
+                    .upstreams
+                    .values()
+                    .next()
+                    .unwrap()
+                    .client_secret
+                    .expose(),
+                expected_value
+            );
+            assert_eq!(aws.calls.lock().unwrap().as_slice(), [expected_source]);
         }
     }
 

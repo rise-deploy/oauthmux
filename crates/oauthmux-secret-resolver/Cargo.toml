@@ -1,6 +1,6 @@
 [package]
-name = "oauthmux-provider-file"
-description = "YAML configuration provider for oauthmux"
+name = "oauthmux-secret-resolver"
+description = "Standard secret source resolution for oauthmux configuration providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,11 +11,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 oauthmux-core = { path = "../oauthmux-core" }
-oauthmux-secret-resolver = { path = "../oauthmux-secret-resolver" }
-serde.workspace = true
-serde_yaml.workspace = true
-tokio.workspace = true
-tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+tokio.workspace = true

@@ -24,8 +24,9 @@ cargo build -p oauthmux
 
 ## Create the configuration
 
-Save this as `config.yaml`. Replace the issuer and client credentials with values from the
-provider. Omit `spec.endpoints` when the issuer publishes standard OIDC discovery metadata.
+Save this as `config.yaml`. Replace the issuer, endpoints, and client credentials with values from
+the provider. The example makes every upstream endpoint explicit so the routing boundary is
+visible.
 
 ```yaml oauthmux-config
 apiVersion: oauthmux.dev/v1alpha1
@@ -34,6 +35,10 @@ metadata:
   name: example
 spec:
   issuerUrl: https://issuer.example.com
+  endpoints:
+    authorization: https://issuer.example.com/oauth2/authorize
+    token: https://issuer.example.com/oauth2/token
+    jwks: https://issuer.example.com/.well-known/jwks.json
   oauthClient:
     clientId: example-client-id
     clientSecret:
@@ -54,14 +59,17 @@ spec:
   clientAuthentication:
     type: Public
   redirectPolicy:
-    allowedOrigins:
-      - https://app.example.com
-    defaultRedirectUri: https://app.example.com/oauth/callback
+    - uri: https://app.example.com/oauth/callback
 ```
+
+If the issuer publishes standard OIDC discovery metadata, omit the complete `spec.endpoints`
+block. oauthmux then resolves the authorization, token, and JWKS endpoints from
+`{issuerUrl}/.well-known/openid-configuration`.
 
 `Public` relays require the application to use S256 PKCE. Server-side relying parties can instead
 use `UpstreamClient`, a relay-specific `ClientSecret`, or `PrivateKeyJwt`; see
 [Client authentication](/oauthmux/configuration/#client-authentication).
+Every authorization request must send the exact configured `redirect_uri`.
 
 ## Start oauthmux
 

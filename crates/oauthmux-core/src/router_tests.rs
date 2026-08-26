@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    ClientAuth, MemoryReplayCache, Origin, ProviderSnapshot, SecretString, Upstream, XChaChaSealer,
+    ClientAuth, MemoryReplayCache, ProviderSnapshot, RedirectMatcher, SecretString, Upstream,
+    XChaChaSealer,
 };
 use axum::{
     body::Body,
@@ -273,14 +274,9 @@ async fn setup_signed_profile(
         .route("/userinfo", get(signed_userinfo))
         .with_state(fixture.clone());
     let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
-    let (redirect_origin, redirect_uri, client_auth) = match profile {
-        RelayProfile::Google => (
-            "https://app.example",
-            "https://app.example/callback",
-            ClientAuth::Public,
-        ),
+    let (redirect_uri, client_auth) = match profile {
+        RelayProfile::Google => ("https://app.example/callback", ClientAuth::Public),
         RelayProfile::Cognito => (
-            "https://cognito.example",
             "https://cognito.example/oauth2/idpresponse",
             ClientAuth::ClientSecret {
                 client_id: "upstream-client".into(),
@@ -304,8 +300,7 @@ async fn setup_signed_profile(
         client_auth: client_auth.clone(),
         scopes: vec!["openid".into(), "email".into(), "profile".into()],
         allowed_scopes: Some(vec!["openid".into(), "email".into(), "profile".into()]),
-        allowed_redirect_origins: vec![Origin::parse(redirect_origin).unwrap()],
-        default_redirect_uri: Some(Url::parse(redirect_uri).unwrap()),
+        redirect_policy: vec![RedirectMatcher::uri(redirect_uri).unwrap()],
     });
     let mut resources = ProviderSnapshot::default();
     resources.upstreams.insert(key.clone(), upstream);
@@ -317,6 +312,7 @@ async fn setup_signed_profile(
             sealer: Arc::new(XChaChaSealer::new(&[8_u8; 32], None).unwrap()),
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::new(),
+            allow_localhost_loopback: false,
         },
         KeyStrategy::SingleSegment,
     );
@@ -378,8 +374,11 @@ async fn setup_with_capture(
         client_auth: auth,
         scopes: vec!["openid".into(), "email".into()],
         allowed_scopes,
-        allowed_redirect_origins: vec![Origin::parse("https://app.example").unwrap()],
-        default_redirect_uri: Some(Url::parse("https://app.example/callback").unwrap()),
+        redirect_policy: vec![
+            RedirectMatcher::uri("https://app.example/callback").unwrap(),
+            RedirectMatcher::uri("https://app.example/callback?channel=stable&next=%2Fhome")
+                .unwrap(),
+        ],
     });
     let mut resources = ProviderSnapshot::default();
     resources.upstreams.insert(key.clone(), upstream);
@@ -392,6 +391,7 @@ async fn setup_with_capture(
             sealer: sealer.clone(),
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::new(),
+            allow_localhost_loopback: false,
         },
         strategy,
     );
@@ -432,8 +432,9 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
                 client_auth: ClientAuth::Public,
                 scopes: vec!["openid".into()],
                 allowed_scopes: None,
-                allowed_redirect_origins: vec![Origin::parse("https://app.example").unwrap()],
-                default_redirect_uri: None,
+                redirect_policy: vec![
+                    RedirectMatcher::uri("https://app.example/callback").unwrap(),
+                ],
             }),
         );
     }
@@ -444,6 +445,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
             replay_cache: None,
             http: reqwest::Client::new(),
+            allow_localhost_loopback: false,
         },
         KeyStrategy::SingleSegment,
     );
@@ -690,6 +692,32 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
         .await
         .unwrap();
     assert_eq!(callback.status(), StatusCode::BAD_REQUEST);
+
+    let disallowed_flow = FlowEnvelope {
+        relay_key: "google".into(),
+        app_redirect_uri: "https://app.example/other".into(),
+        app_state: None,
+        upstream_pkce_verifier: "upstream-verifier".into(),
+        client_code_challenge: Some(pkce_challenge("verifier")),
+        client_code_challenge_method: Some("S256".into()),
+        issued_at: unix_now(),
+        nonce: [5; 16],
+    };
+    let state = sealer
+        .seal(&postcard::to_stdvec(&disallowed_flow).unwrap(), b"google")
+        .unwrap();
+    let callback = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/oidc/upstreams/google/callback?error=access_denied&state={state}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::BAD_REQUEST);
     task.abort();
 }
 
@@ -701,7 +729,7 @@ async fn upstream_authorization_errors_relay_only_to_validated_redirect() {
         .clone()
         .oneshot(
             Request::get(format!(
-                "/oidc/google/authorize?state=application&code_challenge={challenge}"
+                "/oidc/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=application&code_challenge={challenge}"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -731,6 +759,75 @@ async fn upstream_authorization_errors_relay_only_to_validated_redirect() {
     assert!(redirect.query().unwrap().contains("error=access_denied"));
     assert!(redirect.query().unwrap().contains("error_uri="));
     assert!(redirect.query().unwrap().contains("state=application"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn exact_redirect_query_is_matched_before_results_are_appended() {
+    let (app, _, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;
+    let challenge = pkce_challenge("an-application-verifier-with-at-least-forty-three-characters");
+
+    for uri in [
+        format!(
+            "/oidc/google/authorize?code_challenge={challenge}&code_challenge_method=S256"
+        ),
+        format!(
+            "/oidc/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback%3Fchannel%3Dother&code_challenge={challenge}&code_challenge_method=S256"
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    let authorize = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/oidc/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback%3Fchannel%3Dstable%26next%3D%252Fhome&state=application&code_challenge={challenge}&code_challenge_method=S256"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorize.status(), StatusCode::FOUND);
+    let upstream = Url::parse(authorize.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let state = upstream
+        .query_pairs()
+        .find(|(name, _)| name == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let response = app
+        .oneshot(
+            Request::get(format!(
+                "/oidc/upstreams/google/callback?error=access_denied&state={state}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with(
+        "https://app.example/callback?channel=stable&next=%2Fhome&error=access_denied"
+    ));
+    let redirect = Url::parse(location).unwrap();
+    let pairs: Vec<_> = redirect.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs,
+        [
+            ("channel".into(), "stable".into()),
+            ("next".into(), "/home".into()),
+            ("error".into(), "access_denied".into()),
+            ("state".into(), "application".into()),
+        ]
+    );
     task.abort();
 }
 
@@ -777,16 +874,16 @@ async fn authorization_relay_preserves_extensions_and_applies_scope_policy() {
 
     for invalid in [
         format!(
-            "/oidc/relay/authorize?code_challenge={challenge}&code_challenge_method=S256&scope=admin"
+            "/oidc/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&scope=admin"
         ),
         format!(
-            "/oidc/relay/authorize?code_challenge={challenge}&code_challenge_method=S256&request=opaque"
+            "/oidc/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&request=opaque"
         ),
         format!(
-            "/oidc/relay/authorize?code_challenge={challenge}&code_challenge_method=S256&response_mode=form_post"
+            "/oidc/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&response_mode=form_post"
         ),
         format!(
-            "/oidc/relay/authorize?code_challenge={challenge}&code_challenge_method=S256&nonce=one&nonce=two"
+            "/oidc/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&nonce=one&nonce=two"
         ),
     ] {
         let response = app

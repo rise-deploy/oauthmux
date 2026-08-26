@@ -38,9 +38,8 @@ spec:
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
-    allowedOrigins:
-      - https://pool-a.auth.eu-west-1.amazoncognito.com
-      - https://pool-b.auth.us-east-1.amazoncognito.com
+    - uri: https://pool-a.auth.eu-west-1.amazoncognito.com/oauth2/idpresponse
+    - uri: https://pool-b.auth.us-east-1.amazoncognito.com/oauth2/idpresponse
 ```
 
 `Upstream` owns the external issuer, provider endpoints, OAuth client registration, credentials,
@@ -87,8 +86,7 @@ JWKS remain upstream-owned in transparent relay mode.
 | `spec.scopes.default` | no | `[]` | Scopes used when the authorization request omits `scope`. |
 | `spec.scopes.allowed` | no | unrestricted | Complete allow-list for configured and requested scopes. Every default scope must be allowed. |
 | `spec.clientAuthentication` | yes | — | Authentication policy for requests to the relay token endpoint. |
-| `spec.redirectPolicy.allowedOrigins` | no | `[]` | Exact HTTP(S) origins allowed to receive authorization results. |
-| `spec.redirectPolicy.defaultRedirectUri` | no | unset | Redirect used when authorization omits `redirect_uri`; its origin must be allowed. |
+| `spec.redirectPolicy` | yes | — | Non-empty list of explicit application redirect matchers. |
 
 Relay endpoints are derived from the relay name:
 
@@ -97,9 +95,37 @@ https://login.example.com/oidc/cognito-google/authorize
 https://login.example.com/oidc/cognito-google/token
 ```
 
-Allowed redirects match scheme, host, and effective port exactly. Paths are not part of an origin
-entry. HTTP loopback redirects on `localhost`, `127.0.0.1`, and `::1` are accepted for local
-development. User information, fragments, wildcards, and prefix matching are not accepted.
+Every authorization request supplies `redirect_uri`. Policy entries are ORed and each entry
+contains exactly one matcher:
+
+```yaml
+redirectPolicy:
+  - uri: https://app.example.com/oauth/callback?channel=stable
+  - origin: https://preview.example.com
+  - loopback: http://127.0.0.1/oauth/callback
+```
+
+`uri` compares the complete decoded value exactly, including path, query order, encoding, port,
+and trailing slash. It requires HTTPS, except for an exact HTTP URI on `127.0.0.1` or `::1`.
+Static query parameters participate in matching; oauthmux appends generated authorization results
+and application state only after the URI passes policy.
+
+`origin` requires HTTPS and matches scheme, host, and effective port. Every path and query at that
+origin is accepted, which suits preview environments whose callback paths vary.
+
+`loopback` requires HTTP on `127.0.0.1` or `::1` without a configured port. Its path and query
+match exactly while the application may select any runtime port. Use `uri` when a loopback port is
+fixed. `localhost` is not a loopback IP literal; the off-by-default
+`OAUTHMUX_ALLOW_LOCALHOST_LOOPBACK` service option treats it as an alias for a matching IP-literal
+loopback entry.
+
+User information, fragments, wildcards, prefix matching, empty policies, duplicate entries, and
+entries containing more than one matcher are rejected.
+
+The token endpoint derives CORS permission without broadening redirects. A `uri` entry permits its
+origin, an `origin` entry permits that origin, and a `loopback` entry permits its IP host on any
+port. The authorization-code token request must still repeat the exact redirect URI stored for the
+flow.
 
 ## Client authentication
 
@@ -185,24 +211,29 @@ clientSecret:
 ```yaml
 clientSecret:
   valueFrom:
-    ssmParameter:
+    awsSsmParameter:
       name: /oauthmux/secrets/google-client-secret
 ```
 
 ```yaml
 clientSecret:
   valueFrom:
-    secretsManager:
+    awsSecretsManager:
       secretId: oauthmux/google
       jsonKey: clientSecret
 ```
 
-The active configuration provider determines which sources are accepted:
+Resource discovery and secret resolution are separate concerns:
 
 | Provider | Accepted secret forms |
 | --- | --- |
-| [File](/oauthmux/reference/file-provider/) | `value`, `valueFrom.env`, `valueFrom.file` |
-| [AWS SSM](/oauthmux/reference/ssm-provider/) | `valueFrom.ssmParameter`, `valueFrom.secretsManager` |
+| [File](/oauthmux/reference/file-provider/) | `value`, `valueFrom.env`, `valueFrom.file`, `valueFrom.awsSsmParameter`, `valueFrom.awsSecretsManager` |
+| [AWS SSM](/oauthmux/reference/ssm-provider/) | `value`, `valueFrom.env`, `valueFrom.file`, `valueFrom.awsSsmParameter`, `valueFrom.awsSecretsManager` |
+
+Both providers use the same resolver implementation. Relative `file.path` values resolve from a
+File provider resource document's directory. SSM resource documents have no filesystem base, so
+their `file.path` values must be absolute. AWS-prefixed sources require AWS resolution in the
+embedding; the standalone binary includes it through the default `aws` feature.
 
 Identical references are resolved once while compiling a candidate snapshot. Resolved values have
 a redacted debug representation and are not included in configuration errors.

@@ -167,6 +167,20 @@
         "value"
       ]
     },
+    "LoopbackRedirectPolicy": {
+      "description": "Variable-port loopback matcher.",
+      "type": "object",
+      "properties": {
+        "loopback": {
+          "description": "HTTP URI on 127.0.0.1 or ::1 without a port; path and query match exactly.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "loopback"
+      ]
+    },
     "Metadata": {
       "description": "Common resource identity fields.",
       "type": "object",
@@ -200,28 +214,36 @@
         "clientSecret"
       ]
     },
-    "RedirectPolicy": {
-      "description": "Application redirect policy for a relay.",
+    "OriginRedirectPolicy": {
+      "description": "HTTPS origin matcher.",
       "type": "object",
       "properties": {
-        "allowedOrigins": {
-          "description": "Exact HTTP(S) origins allowed to receive authorization results.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "type": "string"
-          }
-        },
-        "defaultRedirectUri": {
-          "description": "Redirect URI used when an authorization request omits `redirect_uri`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
+        "origin": {
+          "description": "HTTPS scheme, host, and optional port; every path and query at the origin is allowed.",
+          "type": "string"
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "required": [
+        "origin"
+      ]
+    },
+    "RedirectPolicyEntry": {
+      "description": "One explicit application redirect matcher.",
+      "anyOf": [
+        {
+          "description": "Match one complete redirect URI exactly.",
+          "$ref": "#/$defs/UriRedirectPolicy"
+        },
+        {
+          "description": "Match every path and query at one HTTPS origin.",
+          "$ref": "#/$defs/OriginRedirectPolicy"
+        },
+        {
+          "description": "Match one loopback path and query on any runtime port.",
+          "$ref": "#/$defs/LoopbackRedirectPolicy"
+        }
+      ]
     },
     "ReferencedSecret": {
       "description": "External secret reference.",
@@ -246,8 +268,12 @@
           "$ref": "#/$defs/ClientAuthentication"
         },
         "redirectPolicy": {
-          "description": "Allowed application redirects and optional default redirect.",
-          "$ref": "#/$defs/RedirectPolicy"
+          "description": "Explicit application redirect matchers.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RedirectPolicyEntry"
+          },
+          "minItems": 1
         },
         "scopes": {
           "description": "Default and allowed upstream scopes.",
@@ -261,7 +287,8 @@
       "additionalProperties": false,
       "required": [
         "upstreamRef",
-        "clientAuthentication"
+        "clientAuthentication",
+        "redirectPolicy"
       ]
     },
     "ResourceReference": {
@@ -357,7 +384,7 @@
           "description": "Exact SSM SecureString parameter resolved by the AWS SSM provider.",
           "type": "object",
           "properties": {
-            "ssmParameter": {
+            "awsSsmParameter": {
               "type": "object",
               "properties": {
                 "name": {
@@ -373,14 +400,14 @@
           },
           "additionalProperties": false,
           "required": [
-            "ssmParameter"
+            "awsSsmParameter"
           ]
         },
         {
           "description": "AWS Secrets Manager SecretString resolved by the AWS SSM provider.",
           "type": "object",
           "properties": {
-            "secretsManager": {
+            "awsSecretsManager": {
               "type": "object",
               "properties": {
                 "jsonKey": {
@@ -404,7 +431,7 @@
           },
           "additionalProperties": false,
           "required": [
-            "secretsManager"
+            "awsSecretsManager"
           ]
         }
       ]
@@ -474,6 +501,20 @@
       "required": [
         "issuerUrl",
         "oauthClient"
+      ]
+    },
+    "UriRedirectPolicy": {
+      "description": "Exact redirect URI matcher.",
+      "type": "object",
+      "properties": {
+        "uri": {
+          "description": "Complete HTTPS URI, or an exact HTTP URI on an IP-literal loopback host.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "uri"
       ]
     }
   }

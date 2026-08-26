@@ -20,6 +20,7 @@ export default defineConfig({
         },
       ],
       sidebar: [
+        { label: 'Home', slug: 'index' },
         {
           label: 'Start here',
           items: [{ label: 'Getting started', slug: 'getting-started' }],

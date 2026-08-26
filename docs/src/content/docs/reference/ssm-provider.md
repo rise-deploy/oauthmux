@@ -4,8 +4,8 @@ description: Load oauthmux resources from SSM Parameter Store and resolve AWS-ma
 ---
 
 The AWS SSM provider discovers complete resource documents under fixed Parameter Store paths. It
-can resolve client secrets from an exact SSM `SecureString` or an AWS Secrets Manager
-`SecretString`.
+uses the standard inline, environment, file, SSM `SecureString`, and Secrets Manager
+`SecretString` resolution shared by every resource provider.
 
 ## Enable the provider
 
@@ -46,7 +46,7 @@ spec:
     clientId: 123456789.apps.googleusercontent.com
     clientSecret:
       valueFrom:
-        ssmParameter:
+        awsSsmParameter:
           name: /oauthmux/secrets/google-client-secret
 ---
 apiVersion: oauthmux.dev/v1alpha1
@@ -61,8 +61,7 @@ spec:
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
-    allowedOrigins:
-      - https://pool.auth.eu-west-1.amazoncognito.com
+    - uri: https://pool.auth.eu-west-1.amazoncognito.com/oauth2/idpresponse
 ```
 
 ## SSM secret reference
@@ -72,7 +71,7 @@ An SSM reference names an absolute parameter. The referenced parameter must use 
 ```yaml
 clientSecret:
   valueFrom:
-    ssmParameter:
+    awsSsmParameter:
       name: /oauthmux/secrets/google-client-secret
 ```
 
@@ -86,7 +85,7 @@ Without `jsonKey`, the complete `SecretString` is the client secret:
 ```yaml
 clientSecret:
   valueFrom:
-    secretsManager:
+    awsSecretsManager:
       secretId: oauthmux/google
 ```
 
@@ -96,13 +95,39 @@ be a string:
 ```yaml
 clientSecret:
   valueFrom:
-    secretsManager:
+    awsSecretsManager:
       secretId: oauthmux/google
       jsonKey: clientSecret
 ```
 
 Nested JSON paths, missing fields, non-string selected values, and binary secrets are rejected.
-Inline, environment, and file secret forms are also rejected by this provider.
+
+## Local secret sources
+
+SSM resource documents use the same inline, environment, and file resolution as File provider
+documents:
+
+```yaml
+clientSecret:
+  value: local-development-secret
+```
+
+```yaml
+clientSecret:
+  valueFrom:
+    env:
+      name: GOOGLE_CLIENT_SECRET
+```
+
+```yaml
+clientSecret:
+  valueFrom:
+    file:
+      path: /run/secrets/google-client-secret
+```
+
+An SSM document has no filesystem base directory, so its file paths must be absolute. Environment
+and file values have trailing CR/LF characters removed, matching File provider behavior.
 
 ## IAM permissions
 

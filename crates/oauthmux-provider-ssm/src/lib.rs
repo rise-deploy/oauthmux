@@ -4,6 +4,7 @@ use oauthmux_core::{
     compile_resources, ConfigProvider, ProviderSnapshot, ResourceDocument, SecretResolver,
     SecretSource, SecretString,
 };
+use oauthmux_secret_resolver::{LocalSecrets, StandardSecretResolver, SystemLocalSecrets};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
@@ -139,6 +140,7 @@ pub struct SsmProvider<C, S> {
     secrets_manager: Arc<S>,
     prefix: String,
     poll_interval: Duration,
+    local_secrets: Arc<dyn LocalSecrets>,
 }
 
 impl<C, S> SsmProvider<C, S> {
@@ -160,7 +162,14 @@ impl<C, S> SsmProvider<C, S> {
             secrets_manager,
             prefix,
             poll_interval,
+            local_secrets: Arc::new(SystemLocalSecrets),
         })
+    }
+
+    /// Supplies environment and filesystem access for local secret sources.
+    pub fn with_local_secrets(mut self, local_secrets: Arc<dyn LocalSecrets>) -> Self {
+        self.local_secrets = local_secrets;
+        self
     }
 }
 
@@ -200,10 +209,12 @@ impl<C: SsmClient, S: SecretsManagerClient> SsmProvider<C, S> {
                 }
             }
         }
-        let resolver = AwsSecretResolver {
-            ssm: self.client.as_ref(),
-            secrets_manager: self.secrets_manager.as_ref(),
-        };
+        let resolver = StandardSecretResolver::new(None)
+            .with_local_secrets(self.local_secrets.clone())
+            .with_aws_secrets(Arc::new(AwsSecretResolver::new(
+                self.client.clone(),
+                self.secrets_manager.clone(),
+            )));
         compile_resources(documents, &resolver).await
     }
 }
@@ -261,22 +272,31 @@ fn expected_identity<'a>(prefix: &str, name: &'a str) -> anyhow::Result<(&'stati
     Ok((kind, segments[1]))
 }
 
-struct AwsSecretResolver<'a, C, S> {
-    ssm: &'a C,
-    secrets_manager: &'a S,
+/// Resolves SSM Parameter Store and Secrets Manager secret references.
+pub struct AwsSecretResolver<C, S> {
+    ssm: Arc<C>,
+    secrets_manager: Arc<S>,
+}
+
+impl<C, S> AwsSecretResolver<C, S> {
+    /// Creates a resolver backed by the supplied client implementations.
+    pub fn new(ssm: Arc<C>, secrets_manager: Arc<S>) -> Self {
+        Self {
+            ssm,
+            secrets_manager,
+        }
+    }
 }
 
 #[async_trait]
-impl<C: SsmClient, S: SecretsManagerClient> SecretResolver for AwsSecretResolver<'_, C, S> {
+impl<C: SsmClient, S: SecretsManagerClient> SecretResolver for AwsSecretResolver<C, S> {
     async fn resolve_value(&self, _: &str) -> anyhow::Result<SecretString> {
-        Err(anyhow!(
-            "inline secret values are not supported by the SSM provider"
-        ))
+        Err(anyhow!("inline values are not AWS secret sources"))
     }
 
     async fn resolve_source(&self, source: &SecretSource) -> anyhow::Result<SecretString> {
         let value = match source {
-            SecretSource::SsmParameter { name } => {
+            SecretSource::AwsSsmParameter { name } => {
                 if !name.starts_with('/') {
                     return Err(anyhow!("SSM parameter name must be absolute"));
                 }
@@ -292,7 +312,7 @@ impl<C: SsmClient, S: SecretsManagerClient> SecretResolver for AwsSecretResolver
                 }
                 parameter.value
             }
-            SecretSource::SecretsManager {
+            SecretSource::AwsSecretsManager {
                 secret_id,
                 json_key,
             } => {
@@ -317,9 +337,7 @@ impl<C: SsmClient, S: SecretsManagerClient> SecretResolver for AwsSecretResolver
                 }
             }
             SecretSource::Env { .. } | SecretSource::File { .. } => {
-                return Err(anyhow!(
-                    "local secret sources are not supported by the SSM provider"
-                ))
+                return Err(anyhow!("local values are not AWS secret sources"))
             }
         };
         Ok(SecretString::new(value))
@@ -329,7 +347,35 @@ impl<C: SsmClient, S: SecretsManagerClient> SecretResolver for AwsSecretResolver
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashMap, sync::Mutex};
+    use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+
+    #[derive(Default)]
+    struct MockLocalSecrets {
+        environment: HashMap<String, String>,
+        files: HashMap<PathBuf, String>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl LocalSecrets for MockLocalSecrets {
+        fn environment(&self, name: &str) -> anyhow::Result<String> {
+            self.calls.lock().unwrap().push(format!("env:{name}"));
+            self.environment
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing environment variable"))
+        }
+
+        fn file(&self, path: &std::path::Path) -> anyhow::Result<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("file:{}", path.display()));
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing secret file"))
+        }
+    }
 
     #[derive(Default)]
     struct MockSsm {
@@ -402,6 +448,8 @@ spec:
     name: google
   clientAuthentication:
     type: UpstreamClient
+  redirectPolicy:
+    - uri: https://app.example/callback
 "#
         .into()
     }
@@ -446,7 +494,7 @@ spec:
     async fn resolves_secure_ssm_parameter() {
         let secret_name = "/oauthmux/secrets/google";
         let (snapshot, ssm, manager) = load(
-            "      valueFrom:\n        ssmParameter:\n          name: /oauthmux/secrets/google",
+            "      valueFrom:\n        awsSsmParameter:\n          name: /oauthmux/secrets/google",
             HashMap::from([(
                 secret_name.into(),
                 Parameter {
@@ -475,7 +523,7 @@ spec:
     #[tokio::test]
     async fn resolves_whole_secrets_manager_secret_string() {
         let (snapshot, _, manager) = load(
-            "      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google",
+            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google",
             HashMap::new(),
             HashMap::from([("oauthmux/google".into(), Some("whole-secret".into()))]),
         )
@@ -499,7 +547,7 @@ spec:
     #[tokio::test]
     async fn resolves_secrets_manager_json_key() {
         let (snapshot, _, _) = load(
-            "      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
+            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
             HashMap::new(),
             HashMap::from([(
                 "oauthmux/google".into(),
@@ -526,7 +574,7 @@ spec:
                 resources: vec![
                     resource(
                         "/oauthmux/upstreams/google",
-                        upstream("      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret"),
+                        upstream("      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret"),
                     ),
                     resource("/oauthmux/relays/cognito-google", relay()),
                 ],
@@ -571,11 +619,32 @@ spec:
     }
 
     #[tokio::test]
-    async fn rejects_inline_and_local_secret_sources() {
-        for secret in [
-            "      value: inline",
-            "      valueFrom:\n        env:\n          name: GOOGLE_SECRET",
-            "      valueFrom:\n        file:\n          path: /run/secrets/google",
+    async fn resolves_inline_environment_and_absolute_file_sources() {
+        for (secret, expected, local) in [
+            (
+                "      value: inline",
+                "inline",
+                Arc::new(MockLocalSecrets::default()),
+            ),
+            (
+                "      valueFrom:\n        env:\n          name: GOOGLE_SECRET",
+                "from-env",
+                Arc::new(MockLocalSecrets {
+                    environment: HashMap::from([("GOOGLE_SECRET".into(), "from-env\n".into())]),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "      valueFrom:\n        file:\n          path: /run/secrets/google",
+                "from-file",
+                Arc::new(MockLocalSecrets {
+                    files: HashMap::from([(
+                        PathBuf::from("/run/secrets/google"),
+                        "from-file\n".into(),
+                    )]),
+                    ..Default::default()
+                }),
+            ),
         ] {
             let ssm = Arc::new(MockSsm {
                 resources: vec![
@@ -590,9 +659,43 @@ spec:
                 DEFAULT_PREFIX,
                 Duration::from_secs(1),
             )
-            .unwrap();
-            assert!(provider.load().await.is_err());
+            .unwrap()
+            .with_local_secrets(local);
+            let snapshot = provider.load().await.unwrap();
+            assert_eq!(
+                snapshot
+                    .upstreams
+                    .values()
+                    .next()
+                    .unwrap()
+                    .client_secret
+                    .expose(),
+                expected
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn ssm_resources_require_absolute_secret_file_paths() {
+        let ssm = Arc::new(MockSsm {
+            resources: vec![
+                resource(
+                    "/oauthmux/upstreams/google",
+                    upstream("      valueFrom:\n        file:\n          path: relative-secret"),
+                ),
+                resource("/oauthmux/relays/cognito-google", relay()),
+            ],
+            ..Default::default()
+        });
+        let provider = SsmProvider::new(
+            ssm,
+            Arc::new(MockSecretsManager::default()),
+            DEFAULT_PREFIX,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let error = provider.load().await.unwrap_err();
+        assert!(format!("{error:#}").contains("resource base directory"));
     }
 
     #[tokio::test]
@@ -603,7 +706,7 @@ spec:
                 resource(
                     "/oauthmux/upstreams/google",
                     upstream(
-                        "      valueFrom:\n        ssmParameter:\n          name: /oauthmux/secrets/google",
+                        "      valueFrom:\n        awsSsmParameter:\n          name: /oauthmux/secrets/google",
                     ),
                 ),
                 resource("/oauthmux/relays/cognito-google", relay()),
@@ -632,7 +735,7 @@ spec:
                 resource(
                     "/oauthmux/upstreams/google",
                     upstream(
-                        "      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google",
+                        "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google",
                     ),
                 ),
                 resource("/oauthmux/relays/cognito-google", relay()),

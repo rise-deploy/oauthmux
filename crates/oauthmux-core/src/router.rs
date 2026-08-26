@@ -31,6 +31,7 @@ pub struct MuxConfig {
     pub sealer: Arc<dyn Sealer>,
     pub replay_cache: Option<Arc<dyn ReplayCache>>,
     pub http: reqwest::Client,
+    pub allow_localhost_loopback: bool,
 }
 
 #[derive(Clone)]
@@ -217,7 +218,11 @@ async fn dispatch(
             };
             authorize(&state, &relay, &upstream, query).await
         }
-        (Endpoint::Token, Method::OPTIONS) => preflight(&relay, request.headers()),
+        (Endpoint::Token, Method::OPTIONS) => preflight(
+            &relay,
+            request.headers(),
+            state.cfg.allow_localhost_loopback,
+        ),
         (Endpoint::Token, Method::POST) => token(&state, &relay, &upstream, request).await,
         (Endpoint::Discovery, Method::GET) => discovery(&state, &relay, &upstream).await,
         (Endpoint::Jwks, Method::GET) => jwks(&state, &upstream).await,
@@ -418,16 +423,12 @@ async fn authorize(
     upstream: &Upstream,
     query: AuthorizeRequest,
 ) -> Response {
-    let redirect = match query.redirect_uri {
-        Some(value) => match Url::parse(&value) {
-            Ok(url) if relay.redirect_allowed(&url) => url,
-            _ => return StatusCode::BAD_REQUEST.into_response(),
-        },
-        None => match &relay.default_redirect_uri {
-            Some(url) => url.clone(),
-            None => return StatusCode::BAD_REQUEST.into_response(),
-        },
+    let Some(redirect_value) = query.redirect_uri else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
+    if !relay.redirect_allowed(&redirect_value, state.cfg.allow_localhost_loopback) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
     if query
         .code_challenge_method
         .as_deref()
@@ -461,7 +462,7 @@ async fn authorize(
     let verifier = random_urlsafe(64);
     let flow = FlowEnvelope {
         relay_key: relay.key.to_string(),
-        app_redirect_uri: redirect.to_string(),
+        app_redirect_uri: redirect_value,
         app_state: query.state,
         upstream_pkce_verifier: verifier.clone(),
         client_code_challenge_method: query.code_challenge.as_ref().map(|_| "S256".to_owned()),
@@ -502,19 +503,19 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let relay = match state.resolver.resolve_relay(&relay_key).await {
-        Ok(Some(relay)) if relay.upstream == upstream.key => relay,
+        Ok(Some(relay)) if relay.upstream == upstream.key && relay.validate().is_ok() => relay,
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let mut redirect = match Url::parse(&flow.app_redirect_uri) {
-        Ok(url) if relay.redirect_allowed(&url) => url,
-        _ => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    if !relay.redirect_allowed(&flow.app_redirect_uri, state.cfg.allow_localhost_loopback) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let mut redirect = flow.app_redirect_uri.clone();
     if query.error {
-        redirect.query_pairs_mut().extend_pairs(query.forwarded);
+        append_query_pairs(&mut redirect, &query.forwarded);
         if let Some(app_state) = flow.app_state {
-            redirect.query_pairs_mut().append_pair("state", &app_state);
+            append_query_pairs(&mut redirect, &[("state".into(), app_state)]);
         }
-        return found(redirect.as_str());
+        return found(&redirect);
     }
     let Some(code) = query.code else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -571,12 +572,27 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
     if sealed.len() > 4096 {
         tracing::warn!(relay = %relay.key, size = sealed.len(), "sealed authorization code may exceed URL limits");
     }
-    redirect.query_pairs_mut().append_pair("code", &sealed);
-    redirect.query_pairs_mut().extend_pairs(query.forwarded);
+    append_query_pairs(&mut redirect, &[("code".into(), sealed)]);
+    append_query_pairs(&mut redirect, &query.forwarded);
     if let Some(app_state) = flow.app_state {
-        redirect.query_pairs_mut().append_pair("state", &app_state);
+        append_query_pairs(&mut redirect, &[("state".into(), app_state)]);
     }
-    found(redirect.as_str())
+    found(&redirect)
+}
+
+fn append_query_pairs(url: &mut String, pairs: &[(String, String)]) {
+    if pairs.is_empty() {
+        return;
+    }
+    if !url.contains('?') {
+        url.push('?');
+    } else if !url.ends_with(['?', '&']) {
+        url.push('&');
+    }
+    let encoded = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
+        .finish();
+    url.push_str(&encoded);
 }
 
 async fn token(
@@ -585,7 +601,7 @@ async fn token(
     upstream: &Upstream,
     request: Request<Body>,
 ) -> Response {
-    let origin = allowed_cors_origin(relay, request.headers());
+    let origin = allowed_cors_origin(relay, request.headers(), state.cfg.allow_localhost_loopback);
     let bytes = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -1022,21 +1038,25 @@ fn stored_response(stored: StoredResponse) -> Response {
     response.body(Body::from(stored.body)).unwrap()
 }
 
-fn preflight(relay: &Relay, headers: &HeaderMap) -> Response {
-    let origin = allowed_cors_origin(relay, headers);
+fn preflight(relay: &Relay, headers: &HeaderMap, allow_localhost_loopback: bool) -> Response {
+    let origin = allowed_cors_origin(relay, headers, allow_localhost_loopback);
     if origin.is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
     with_cors(StatusCode::NO_CONTENT.into_response(), origin)
 }
 
-fn allowed_cors_origin(relay: &Relay, headers: &HeaderMap) -> Option<HeaderValue> {
+fn allowed_cors_origin(
+    relay: &Relay,
+    headers: &HeaderMap,
+    allow_localhost_loopback: bool,
+) -> Option<HeaderValue> {
     let value = headers.get(header::ORIGIN)?;
     let url = Url::parse(value.to_str().ok()?).ok()?;
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         return None;
     }
-    if relay.redirect_allowed(&url) {
+    if relay.cors_origin_allowed(&url, allow_localhost_loopback) {
         Some(value.clone())
     } else {
         None

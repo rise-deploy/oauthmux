@@ -66,6 +66,7 @@ jobs:
           restore-keys: cargo-downloads-${{ runner.os }}-${{ runner.arch }}-
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: mise run features:check
       - name: Test workspace and documentation examples
         run: cargo test --workspace --all-features
       - run: mise run schema:check

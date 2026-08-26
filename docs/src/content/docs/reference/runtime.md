@@ -19,10 +19,19 @@ every configured provider before serving traffic.
 | `OAUTHMUX_PROVIDER_SSM_PREFIX` | one provider required | disabled | Absolute SSM root ending in `/`. |
 | `OAUTHMUX_PROVIDER_SSM_POLL` | no | `60s` | Native SSM reload interval. |
 | `OAUTHMUX_LAMBDA_CONFIG_TTL` | no | `60s` | Maximum Lambda snapshot age before invocation-driven refresh. |
+| `OAUTHMUX_ALLOW_LOCALHOST_LOOPBACK` | no | `false` | Treat `localhost` as an alias for configured IP-literal loopback redirect matchers. |
 | `OAUTHMUX_LOG` | no | `info` | `tracing` filter. |
 
 Durations require an explicit unit such as `30s`, `5m`, or `1h` and must be greater than zero.
+The localhost compatibility value must be `true` or `false`.
 When both providers are enabled, File is evaluated before SSM for collision precedence.
+
+## Build features
+
+The standalone crate enables `aws` and `lambda` by default. `aws` supplies SSM resource discovery
+and AWS secret resolution for both File and SSM providers. A native File-only build without AWS
+SDK dependencies uses `--no-default-features`; in that build, File resources can use inline,
+environment, and file secrets, while AWS secret references fail configuration validation.
 
 ## Native server
 

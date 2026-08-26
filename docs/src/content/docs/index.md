@@ -1,20 +1,6 @@
 ---
 title: oauthmux
 description: One stable upstream OAuth callback, safely relayed to an explicit set of applications.
-template: splash
-hero:
-  tagline: Keep provider callbacks stable without confusing endpoint routing with token trust.
-  actions:
-    - text: Get started
-      link: /oauthmux/getting-started/
-      icon: right-arrow
-      variant: primary
-    - text: Understand the operating modes
-      link: /oauthmux/modes/
-      icon: open-book
-    - text: Configure Cognito with Google
-      link: /oauthmux/guides/cognito-google-relay/
-      icon: external
 ---
 
 oauthmux multiplexes a provider callback across production, preview, and local application
@@ -29,6 +15,29 @@ An **upstream** represents one provider OAuth client and its stable callback. A 
 that upstream and defines the scopes, downstream authentication, and allowed application origins.
 Several relays can share one upstream without creating additional provider callbacks.
 
-Start with [Getting started](/oauthmux/getting-started/), then use the
-[configuration reference](/oauthmux/configuration/) for the complete resource model and secret
-sources.
+## Start here
+
+- [Getting started](/oauthmux/getting-started/) runs the first File-backed transparent relay.
+- [Operating modes](/oauthmux/modes/) explains the endpoint and trust boundaries of transparent
+  relay and brokered issuer modes.
+- [Cognito relay to Google](/oauthmux/guides/cognito-google-relay/) applies one stable Google
+  callback to any number of Cognito user pools.
+
+## Reference
+
+- [Configuration](/oauthmux/configuration/) defines upstreams, relays, authentication, redirect
+  policy, scopes, and secret values.
+- [File provider](/oauthmux/reference/file-provider/) and
+  [AWS SSM provider](/oauthmux/reference/ssm-provider/) describe the available configuration
+  sources.
+- [Runtime and deployment](/oauthmux/reference/runtime/) covers native, container, and Lambda
+  execution.
+- [HTTP endpoints](/oauthmux/reference/http-endpoints/) describes relay, callback, metadata, and
+  health routes.
+
+## Availability
+
+| Mode | Token issuer and signer | Status |
+| --- | --- | --- |
+| Transparent relay | Upstream provider | Available |
+| Brokered issuer | oauthmux | Planned |

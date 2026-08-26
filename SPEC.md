@@ -4,7 +4,7 @@
 
 oauthmux is a reusable OAuth/OIDC transparent relay in Rust. A named upstream owns one external
 OAuth client registration and one stable callback. One or more named relays reference that
-upstream and multiplex authorization results to an explicit set of relying-party origins.
+upstream and multiplex authorization results to an explicit set of relying-party redirects.
 
 The protocol engine is an embeddable Axum router. The standalone binary supplies File and AWS SSM
 configuration providers and runs as a native server or AWS Lambda container.
@@ -18,8 +18,9 @@ continuing to trust the upstream issuer.
 ```text
 crates/
   oauthmux-core/          protocol engine, resources, resolver seams, router, sealing
-  oauthmux-provider-file/ multi-document YAML provider and local secret sources
-  oauthmux-provider-ssm/  SSM resource provider and AWS secret sources
+  oauthmux-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
+  oauthmux-provider-file/ multi-document YAML provider and composable secret resolution
+  oauthmux-provider-ssm/  SSM resource discovery and AWS secret backend
   oauthmux/               provider wiring, native server, Lambda runtime, schema CLI
 ```
 
@@ -46,8 +47,7 @@ pub struct Relay {
     pub client_auth: ClientAuth,
     pub scopes: Vec<String>,
     pub allowed_scopes: Option<Vec<String>>,
-    pub allowed_redirect_origins: Vec<Origin>,
-    pub default_redirect_uri: Option<Url>,
+    pub redirect_policy: Vec<RedirectMatcher>,
 }
 ```
 
@@ -98,8 +98,8 @@ unvalidated redirect URI is never reflected into a response.
 - S256 PKCE only.
 - Flow-state TTL is 10 minutes.
 - Authorization-code TTL is 5 minutes.
-- Redirect policy matches exact HTTP(S) origins. HTTP loopback on `localhost`, `127.0.0.1`, and
-  `::1` is allowed.
+- Redirect policy uses explicit exact-URI, HTTPS-origin, or variable-port IP-loopback matchers.
+- `localhost` aliases an IP-loopback matcher only when service compatibility is enabled.
 - Client-secret comparisons are constant-time.
 - Upstream-owned authorization parameters are replaced rather than forwarded.
 - Other authorization and grant extensions are preserved.
@@ -145,7 +145,7 @@ spec:
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
-    allowedOrigins: [https://app.example.com]
+    - uri: https://app.example.com/oauth/callback
 ```
 
 Unknown fields, kinds, API versions, duplicate identities, invalid URLs, invalid origins, invalid
@@ -163,17 +163,22 @@ The File provider supports:
 clientSecret: { value: local-secret }
 clientSecret: { valueFrom: { env: { name: GOOGLE_CLIENT_SECRET } } }
 clientSecret: { valueFrom: { file: { path: ./secrets/google } } }
+clientSecret: { valueFrom: { awsSsmParameter: { name: /oauthmux/secrets/google } } }
+clientSecret: { valueFrom: { awsSecretsManager: { secretId: oauthmux/google, jsonKey: clientSecret } } }
 ```
 
-Relative file paths resolve from the resource file's directory. File, environment, and inline
-values are re-resolved on every provider refresh.
+Every configuration provider uses the same standard resolver for inline, environment, file, and
+AWS-backed values. Relative file paths resolve from a File resource document's directory; resource
+documents without a filesystem location require absolute paths. Values are re-resolved on every
+provider refresh. The standalone binary supplies AWS resolution when compiled with the default
+`aws` feature.
 
 The SSM provider supports:
 
 ```yaml
 clientSecret:
   valueFrom:
-    ssmParameter:
+    awsSsmParameter:
       name: /oauthmux/secrets/google
 ```
 
@@ -182,7 +187,7 @@ The referenced parameter must exist, have an absolute name, and use the `SecureS
 ```yaml
 clientSecret:
   valueFrom:
-    secretsManager:
+    awsSecretsManager:
       secretId: oauthmux/google
       jsonKey: clientSecret
 ```

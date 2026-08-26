@@ -28,6 +28,10 @@ OIDC `request` and `request_uri` objects are rejected because their embedded rou
 be reconciled safely with proxy-owned values. A supplied scope must pass the relay allow-list. A
 public relay also requires a valid S256 application code challenge.
 
+`redirect_uri` is required and must match one configured redirect-policy entry. Static query
+parameters are part of the match. oauthmux appends authorization results and application state
+only after the redirect has passed policy.
+
 ## Callback
 
 The callback is owned by the upstream, not by an individual relay. Sealed state identifies the

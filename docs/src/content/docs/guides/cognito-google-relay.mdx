@@ -101,27 +101,25 @@ spec:
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
-    allowedOrigins:
-      - https://pool-a.auth.eu-west-1.amazoncognito.com
-      - https://pool-b.auth.us-east-1.amazoncognito.com
-      - https://login.product.example
+    - uri: https://pool-a.auth.eu-west-1.amazoncognito.com/oauth2/idpresponse
+    - uri: https://pool-b.auth.us-east-1.amazoncognito.com/oauth2/idpresponse
 ```
 
-The allow-list contains origins, not paths. A pool's actual redirect ends in
-`/oauth2/idpresponse`, and oauthmux validates its origin before starting the flow.
+Each entry names one complete Cognito callback. oauthmux compares the decoded `redirect_uri`
+exactly before starting the flow, including its path and any configured query.
 
 ### Store the shared upstream in SSM
 
-For Lambda deployments, the SSM provider is a good fit for an allow-list that changes as Cognito
+For Lambda deployments, the SSM provider is a good fit for a redirect policy that changes as Cognito
 pools are created. Store the complete documents as `String` parameters named
-`/oauthmux/upstreams/google` and `/oauthmux/relays/cognito-google`. Add each pool origin to the
+`/oauthmux/upstreams/google` and `/oauthmux/relays/cognito-google`. Add each pool callback to the
 relay document. Store the Google secret separately as a `SecureString`, for example
 `/oauthmux/secrets/google-client-secret`, and use this source in the upstream document:
 
 ```yaml
 clientSecret:
   valueFrom:
-    ssmParameter:
+    awsSsmParameter:
       name: /oauthmux/secrets/google-client-secret
 ```
 
@@ -162,7 +160,7 @@ and include it in the hosted UI's identity-provider choices.
 ## Correctness checks
 
 - Google lists the oauthmux callback, not Cognito's `/oauth2/idpresponse`, as its redirect URI.
-- oauthmux allows the exact hosted-domain origin of every participating pool.
+- oauthmux allows the exact `/oauth2/idpresponse` URI of every participating pool.
 - Cognito's issuer, JWKS, and UserInfo fields point directly to Google.
 - Cognito's authorization and token fields point to the `cognito-google` relay.
 - The Google client ID is Cognito's provider client ID so the Google ID token audience is valid.

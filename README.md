@@ -39,9 +39,9 @@ a separate trust model with its own signing keys, JWKS, audience, claims, and Us
 
 - Authorization-code flow with independent upstream S256 PKCE.
 - Public, shared-secret, upstream-client, and RFC 7523 `private_key_jwt` relay authentication.
-- Exact redirect-origin policy and sealed state/code envelopes.
+- Exact URI, HTTPS-origin, and variable-port loopback redirect policies with sealed state/code envelopes.
 - Transparent authorization, token, refresh, discovery metadata, and JWKS routing.
-- Multi-document File configuration with inline, environment, and file secrets.
+- Multi-document File configuration with local or AWS-backed secret references.
 - AWS SSM resource discovery with SSM `SecureString` and Secrets Manager `jsonKey` references.
 - Invocation-driven Lambda configuration refresh with a 60-second default TTL.
 - Multi-architecture images at `ghcr.io/rise-deploy/oauthmux`.
@@ -87,6 +87,7 @@ The workspace contains:
 
 ```text
 crates/oauthmux-core/          protocol engine and embeddable router
+crates/oauthmux-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
 crates/oauthmux-provider-file/ File configuration provider
 crates/oauthmux-provider-ssm/  AWS SSM and Secrets Manager provider
 crates/oauthmux/               standalone native and Lambda runtime

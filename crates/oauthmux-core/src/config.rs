@@ -1,5 +1,6 @@
 use crate::{
-    ClientAuth, ClientJwks, Origin, ProviderSnapshot, Relay, ResourceKey, SecretString, Upstream,
+    ClientAuth, ClientJwks, ProviderSnapshot, RedirectMatcher, Relay, ResourceKey, SecretString,
+    Upstream,
 };
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -133,9 +134,9 @@ pub struct RelayResourceSpec {
     pub scopes: ScopePolicy,
     /// Authentication required at the relay token endpoint.
     pub client_authentication: ClientAuthentication,
-    /// Allowed application redirects and optional default redirect.
-    #[serde(default)]
-    pub redirect_policy: RedirectPolicy,
+    /// Explicit application redirect matchers.
+    #[schemars(length(min = 1))]
+    pub redirect_policy: Vec<RedirectPolicyEntry>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -158,16 +159,40 @@ pub struct ScopePolicy {
     pub allowed: Option<Vec<String>>,
 }
 
-#[derive(Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-/// Application redirect policy for a relay.
-pub struct RedirectPolicy {
-    /// Exact HTTP(S) origins allowed to receive authorization results.
-    #[serde(default)]
-    pub allowed_origins: Vec<String>,
-    /// Redirect URI used when an authorization request omits `redirect_uri`.
-    #[serde(default)]
-    pub default_redirect_uri: Option<String>,
+#[derive(Deserialize, JsonSchema)]
+#[serde(untagged)]
+/// One explicit application redirect matcher.
+pub enum RedirectPolicyEntry {
+    /// Match one complete redirect URI exactly.
+    Uri(UriRedirectPolicy),
+    /// Match every path and query at one HTTPS origin.
+    Origin(OriginRedirectPolicy),
+    /// Match one loopback path and query on any runtime port.
+    Loopback(LoopbackRedirectPolicy),
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Exact redirect URI matcher.
+pub struct UriRedirectPolicy {
+    /// Complete HTTPS URI, or an exact HTTP URI on an IP-literal loopback host.
+    uri: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// HTTPS origin matcher.
+pub struct OriginRedirectPolicy {
+    /// HTTPS scheme, host, and optional port; every path and query at the origin is allowed.
+    origin: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+/// Variable-port loopback matcher.
+pub struct LoopbackRedirectPolicy {
+    /// HTTP URI on 127.0.0.1 or ::1 without a port; path and query match exactly.
+    loopback: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -254,12 +279,12 @@ pub enum SecretSource {
         path: String,
     },
     /// Exact SSM SecureString parameter resolved by the AWS SSM provider.
-    SsmParameter {
+    AwsSsmParameter {
         /// Absolute SSM parameter name.
         name: String,
     },
     /// AWS Secrets Manager SecretString resolved by the AWS SSM provider.
-    SecretsManager {
+    AwsSecretsManager {
         /// Secret name or ARN passed to Secrets Manager GetSecretValue.
         #[serde(rename = "secretId")]
         secret_id: String,
@@ -354,25 +379,31 @@ pub async fn compile_resources(
                 },
             },
         };
-        let allowed_redirect_origins = resource
+        let redirect_policy = resource
             .spec
             .redirect_policy
-            .allowed_origins
-            .iter()
-            .map(|value| Origin::parse(value).map_err(anyhow::Error::msg))
-            .collect::<anyhow::Result<Vec<_>>>()
-            .with_context(|| format!("Relay/{key} spec.redirectPolicy.allowedOrigins"))?;
+            .into_iter()
+            .enumerate()
+            .map(|(index, policy)| {
+                let matcher = match policy {
+                    RedirectPolicyEntry::Uri(policy) => RedirectMatcher::uri(policy.uri),
+                    RedirectPolicyEntry::Origin(policy) => RedirectMatcher::origin(&policy.origin),
+                    RedirectPolicyEntry::Loopback(policy) => {
+                        RedirectMatcher::loopback(&policy.loopback)
+                    }
+                };
+                matcher
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| format!("Relay/{key} spec.redirectPolicy[{index}]"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         let relay = Relay {
             key: key.clone(),
             upstream,
             client_auth,
             scopes: resource.spec.scopes.default,
             allowed_scopes: resource.spec.scopes.allowed,
-            allowed_redirect_origins,
-            default_redirect_uri: parse_optional_url(
-                "spec.redirectPolicy.defaultRedirectUri",
-                resource.spec.redirect_policy.default_redirect_uri,
-            )?,
+            redirect_policy,
         };
         relay
             .validate()
@@ -471,7 +502,9 @@ mod tests {
                     },
                     scopes: ScopePolicy::default(),
                     client_authentication: ClientAuthentication::UpstreamClient,
-                    redirect_policy: RedirectPolicy::default(),
+                    redirect_policy: vec![RedirectPolicyEntry::Uri(UriRedirectPolicy {
+                        uri: "https://app.example/callback".into(),
+                    })],
                 },
             }),
         ]
@@ -500,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolves_and_deduplicates_relay_client_secret_references() {
-        let source = SecretSource::SsmParameter {
+        let source = SecretSource::AwsSsmParameter {
             name: "/oauthmux/secrets/shared".into(),
         };
         let mut resources = documents(SecretValue::ValueFrom(ReferencedSecret {
@@ -547,15 +580,82 @@ mod tests {
         assert!(serde_json::from_str::<SecretValue>(ambiguous).is_err());
     }
 
+    #[tokio::test]
+    async fn redirect_policy_requires_strict_non_empty_entries() {
+        let valid = r#"[
+            {"uri":"https://app.example/callback?channel=stable"},
+            {"origin":"https://preview.example"},
+            {"loopback":"http://127.0.0.1/callback"}
+        ]"#;
+        let entries: Vec<RedirectPolicyEntry> = serde_json::from_str(valid).unwrap();
+        assert_eq!(entries.len(), 3);
+        for invalid in [
+            r#"[{"uri":"https://app.example/callback","origin":"https://app.example"}]"#,
+            r#"[{"prefix":"https://app.example"}]"#,
+            r#"{"allowedOrigins":["https://app.example"]}"#,
+        ] {
+            assert!(serde_json::from_str::<Vec<RedirectPolicyEntry>>(invalid).is_err());
+        }
+
+        let secrets = MockSecrets {
+            calls: Mutex::new(vec![]),
+        };
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "inline".into(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!();
+        };
+        relay.spec.redirect_policy.clear();
+        let error = compile_resources(resources, &secrets).await.unwrap_err();
+        assert!(format!("{error:#}").contains("at least one matcher"));
+
+        let mut resources = documents(SecretValue::Value(InlineSecret {
+            value: "inline".into(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!();
+        };
+        relay
+            .spec
+            .redirect_policy
+            .push(RedirectPolicyEntry::Uri(UriRedirectPolicy {
+                uri: "https://app.example/callback".into(),
+            }));
+        let error = compile_resources(resources, &secrets).await.unwrap_err();
+        assert!(format!("{error:#}").contains("must not contain duplicates"));
+    }
+
     #[test]
     fn generated_schema_contains_versioned_resources_and_json_key() {
         let schema = serde_json::to_string(&resource_schema()).unwrap();
         assert!(schema.contains(API_VERSION));
         assert!(schema.contains("Upstream"));
         assert!(schema.contains("Relay"));
-        assert!(schema.contains("secretsManager"));
+        assert!(schema.contains("awsSsmParameter"));
+        assert!(schema.contains("awsSecretsManager"));
         assert!(schema.contains("jsonKey"));
         assert!(schema.contains("stable callback"));
-        assert!(schema.contains("Exact HTTP(S) origins"));
+        assert!(schema.contains("complete redirect URI exactly"));
+    }
+
+    #[test]
+    fn aws_secret_sources_require_cloud_prefixed_keys() {
+        assert!(serde_json::from_str::<SecretSource>(
+            r#"{"awsSsmParameter":{"name":"/oauthmux/secrets/google"}}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<SecretSource>(
+            r#"{"awsSecretsManager":{"secretId":"oauthmux/google","jsonKey":"clientSecret"}}"#
+        )
+        .is_ok());
+        assert!(serde_json::from_str::<SecretSource>(
+            r#"{"ssmParameter":{"name":"/oauthmux/secrets/google"}}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<SecretSource>(
+            r#"{"secretsManager":{"secretId":"oauthmux/google"}}"#
+        )
+        .is_err());
     }
 }

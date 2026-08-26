@@ -9,11 +9,12 @@ rust-version.workspace = true
 
 [features]
 default = ["aws"]
-aws = ["dep:aws-sdk-ssm"]
+aws = ["dep:aws-sdk-secretsmanager", "dep:aws-sdk-ssm"]
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-ssm = { workspace = true, optional = true }
 oauthmux-core = { path = "../oauthmux-core" }
 serde.workspace = true

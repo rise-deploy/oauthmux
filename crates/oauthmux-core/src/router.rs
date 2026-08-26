@@ -1,6 +1,6 @@
 use crate::{
-    model::valid_scope_token, ClientAuth, ClientJwks, Instance, InstanceKey, InstanceResolver,
-    ReplayCache, Sealer,
+    model::valid_scope_token, ClientAuth, ClientJwks, Relay, ReplayCache, ResourceKey,
+    ResourceResolver, Sealer, Upstream,
 };
 use axum::{
     body::Body,
@@ -40,11 +40,11 @@ pub enum KeyStrategy {
     Custom(Arc<KeyMapper>),
 }
 
-pub type KeyMapper = dyn Fn(&[&str]) -> Option<InstanceKey> + Send + Sync;
+pub type KeyMapper = dyn Fn(&[&str]) -> Option<ResourceKey> + Send + Sync;
 
 #[derive(Clone)]
 struct AppState {
-    resolver: Arc<dyn InstanceResolver>,
+    resolver: Arc<dyn ResourceResolver>,
     cfg: Arc<MuxConfig>,
     keys: KeyStrategy,
     cache: Arc<Mutex<HashMap<String, CachedJson>>>,
@@ -58,7 +58,7 @@ struct CachedJson {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FlowEnvelope {
-    instance_key: String,
+    relay_key: String,
     app_redirect_uri: String,
     app_state: Option<String>,
     upstream_pkce_verifier: String,
@@ -70,7 +70,7 @@ struct FlowEnvelope {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CodeEnvelope {
-    instance_key: String,
+    relay_key: String,
     envelope_id: [u8; 16],
     issued_at: u64,
     redirect_uri: String,
@@ -124,7 +124,7 @@ enum Endpoint {
     Jwks,
 }
 
-pub fn router(resolver: Arc<dyn InstanceResolver>, cfg: MuxConfig, keys: KeyStrategy) -> Router {
+pub fn router(resolver: Arc<dyn ResourceResolver>, cfg: MuxConfig, keys: KeyStrategy) -> Router {
     let state = AppState {
         resolver,
         cfg: Arc::new(cfg),
@@ -144,28 +144,66 @@ async fn dispatch(
     let Some((key, endpoint)) = parse_path(&path, &state.keys) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let instance = match state.resolver.resolve(&key).await {
-        Ok(Some(instance)) => instance,
+    if matches!(endpoint, Endpoint::Callback) {
+        let upstream = match state.resolver.resolve_upstream(&key).await {
+            Ok(Some(upstream)) => upstream,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        if upstream.validate().is_err() {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        if request.method() != Method::GET {
+            return StatusCode::METHOD_NOT_ALLOWED.into_response();
+        }
+        let query = match parse_callback_request(request.uri()) {
+            Ok(query) => query,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        };
+        return callback(&state, &upstream, query).await;
+    }
+
+    let relay = match state.resolver.resolve_relay(&key).await {
+        Ok(Some(relay)) => relay,
         Ok(None) if matches!(endpoint, Endpoint::Token) => {
-            return oauth_error(StatusCode::NOT_FOUND, "invalid_request", "unknown instance")
+            return oauth_error(StatusCode::NOT_FOUND, "invalid_request", "unknown relay")
         }
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) if matches!(endpoint, Endpoint::Token) => {
             return oauth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
-                "instance resolution failed",
+                "relay resolution failed",
             )
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    if let Err(error) = instance.validate() {
-        tracing::error!(%key, %error, "resolved instance is invalid");
+    let upstream = match state.resolver.resolve_upstream(&relay.upstream).await {
+        Ok(Some(upstream)) => upstream,
+        Ok(None) if matches!(endpoint, Endpoint::Token) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "relay upstream is unavailable",
+            )
+        }
+        Ok(None) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Err(_) if matches!(endpoint, Endpoint::Token) => {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "upstream resolution failed",
+            )
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    if let Err(error) = relay.validate() {
+        tracing::error!(%key, %error, "resolved relay is invalid");
         if matches!(endpoint, Endpoint::Token) {
             return oauth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
-                "instance configuration is invalid",
+                "relay configuration is invalid",
             );
         }
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -177,44 +215,42 @@ async fn dispatch(
                 Ok(query) => query,
                 Err(_) => return StatusCode::BAD_REQUEST.into_response(),
             };
-            authorize(&state, &instance, query).await
+            authorize(&state, &relay, &upstream, query).await
         }
-        (Endpoint::Callback, Method::GET) => {
-            let query = match parse_callback_request(request.uri()) {
-                Ok(query) => query,
-                Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-            };
-            callback(&state, &instance, query).await
-        }
-        (Endpoint::Token, Method::OPTIONS) => preflight(&instance, request.headers()),
-        (Endpoint::Token, Method::POST) => token(&state, &instance, request).await,
-        (Endpoint::Discovery, Method::GET) => discovery(&state, &instance).await,
-        (Endpoint::Jwks, Method::GET) => jwks(&state, &instance).await,
+        (Endpoint::Token, Method::OPTIONS) => preflight(&relay, request.headers()),
+        (Endpoint::Token, Method::POST) => token(&state, &relay, &upstream, request).await,
+        (Endpoint::Discovery, Method::GET) => discovery(&state, &relay, &upstream).await,
+        (Endpoint::Jwks, Method::GET) => jwks(&state, &upstream).await,
         _ => StatusCode::METHOD_NOT_ALLOWED.into_response(),
     }
 }
 
-fn parse_path(path: &str, strategy: &KeyStrategy) -> Option<(InstanceKey, Endpoint)> {
+fn parse_path(path: &str, strategy: &KeyStrategy) -> Option<(ResourceKey, Endpoint)> {
     let segments: Vec<_> = path.trim_matches('/').split('/').collect();
-    let (key_parts, endpoint) = if segments.ends_with(&[".well-known", "openid-configuration"]) {
-        (
-            &segments[..segments.len().checked_sub(2)?],
-            Endpoint::Discovery,
-        )
-    } else {
-        let endpoint = match *segments.last()? {
-            "authorize" => Endpoint::Authorize,
-            "callback" => Endpoint::Callback,
-            "token" => Endpoint::Token,
-            "jwks" => Endpoint::Jwks,
-            _ => return None,
+    let (key_parts, endpoint) =
+        if segments.first() == Some(&"upstreams") && segments.last() == Some(&"callback") {
+            (
+                &segments[1..segments.len().checked_sub(1)?],
+                Endpoint::Callback,
+            )
+        } else if segments.ends_with(&[".well-known", "openid-configuration"]) {
+            (
+                &segments[..segments.len().checked_sub(2)?],
+                Endpoint::Discovery,
+            )
+        } else {
+            let endpoint = match *segments.last()? {
+                "authorize" => Endpoint::Authorize,
+                "token" => Endpoint::Token,
+                "jwks" => Endpoint::Jwks,
+                _ => return None,
+            };
+            (&segments[..segments.len().checked_sub(1)?], endpoint)
         };
-        (&segments[..segments.len().checked_sub(1)?], endpoint)
-    };
     let key = match strategy {
-        KeyStrategy::SingleSegment if key_parts.len() == 1 => InstanceKey::new(key_parts[0]).ok(),
+        KeyStrategy::SingleSegment if key_parts.len() == 1 => ResourceKey::new(key_parts[0]).ok(),
         KeyStrategy::TwoSegment if key_parts.len() == 2 => {
-            InstanceKey::new(format!("{}/{}", key_parts[0], key_parts[1])).ok()
+            ResourceKey::new(format!("{}/{}", key_parts[0], key_parts[1])).ok()
         }
         KeyStrategy::Custom(map) => map(key_parts),
         _ => None,
@@ -315,20 +351,16 @@ fn parse_callback_request(uri: &Uri) -> Result<CallbackRequest, ()> {
     })
 }
 
-fn scope_allowed(instance: &Instance, scope: &str) -> bool {
+fn scope_allowed(relay: &Relay, scope: &str) -> bool {
     let scopes: Vec<_> = scope.split(' ').collect();
     if scopes.is_empty() || scopes.iter().any(|scope| !valid_scope_token(scope)) {
         return false;
     }
-    instance
-        .upstream
-        .allowed_scopes
-        .as_ref()
-        .is_none_or(|allowed| {
-            scopes
-                .iter()
-                .all(|scope| allowed.iter().any(|candidate| candidate == scope))
-        })
+    relay.allowed_scopes.as_ref().is_none_or(|allowed| {
+        scopes
+            .iter()
+            .all(|scope| allowed.iter().any(|candidate| candidate == scope))
+    })
 }
 
 fn parse_token_request(body: &[u8]) -> Result<TokenRequest, ()> {
@@ -380,13 +412,18 @@ fn parse_token_request(body: &[u8]) -> Result<TokenRequest, ()> {
     })
 }
 
-async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeRequest) -> Response {
+async fn authorize(
+    state: &AppState,
+    relay: &Relay,
+    upstream: &Upstream,
+    query: AuthorizeRequest,
+) -> Response {
     let redirect = match query.redirect_uri {
         Some(value) => match Url::parse(&value) {
-            Ok(url) if instance.redirect_allowed(&url) => url,
+            Ok(url) if relay.redirect_allowed(&url) => url,
             _ => return StatusCode::BAD_REQUEST.into_response(),
         },
-        None => match &instance.default_redirect_uri {
+        None => match &relay.default_redirect_uri {
             Some(url) => url.clone(),
             None => return StatusCode::BAD_REQUEST.into_response(),
         },
@@ -401,7 +438,7 @@ async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeReques
     if query.code_challenge.is_none() && query.code_challenge_method.is_some() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if matches!(instance.client_auth, ClientAuth::Public) && query.code_challenge.is_none() {
+    if matches!(relay.client_auth, ClientAuth::Public) && query.code_challenge.is_none() {
         return StatusCode::BAD_REQUEST.into_response();
     }
     if query
@@ -412,18 +449,18 @@ async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeReques
         return StatusCode::BAD_REQUEST.into_response();
     }
     let scope = match query.scope {
-        Some(scope) if scope_allowed(instance, &scope) => Some(scope),
+        Some(scope) if scope_allowed(relay, &scope) => Some(scope),
         Some(_) => return StatusCode::BAD_REQUEST.into_response(),
-        None if instance.upstream.scopes.is_empty() => None,
-        None => Some(instance.upstream.scopes.join(" ")),
+        None if relay.scopes.is_empty() => None,
+        None => Some(relay.scopes.join(" ")),
     };
-    let endpoints = match resolve_endpoints(state, instance).await {
+    let endpoints = match resolve_endpoints(state, upstream).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
     let verifier = random_urlsafe(64);
     let flow = FlowEnvelope {
-        instance_key: instance.key.to_string(),
+        relay_key: relay.key.to_string(),
         app_redirect_uri: redirect.to_string(),
         app_state: query.state,
         upstream_pkce_verifier: verifier.clone(),
@@ -432,17 +469,17 @@ async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeReques
         issued_at: unix_now(),
         nonce: random_array(),
     };
-    let sealed = match seal_postcard(state, instance, &flow) {
+    let sealed = match seal_postcard(state, &upstream.key, &flow) {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
-    let callback = callback_url(&state.cfg.public_url, &instance.key);
-    let mut upstream = endpoints.authorization_endpoint;
+    let callback = callback_url(&state.cfg.public_url, &upstream.key);
+    let mut authorization_endpoint = endpoints.authorization_endpoint;
     {
-        let mut params = upstream.query_pairs_mut();
+        let mut params = authorization_endpoint.query_pairs_mut();
         params
             .append_pair("response_type", "code")
-            .append_pair("client_id", &instance.upstream.client_id)
+            .append_pair("client_id", &upstream.client_id)
             .append_pair("redirect_uri", callback.as_str())
             .append_pair("state", &sealed)
             .append_pair("code_challenge", &pkce_challenge(&verifier))
@@ -452,20 +489,24 @@ async fn authorize(state: &AppState, instance: &Instance, query: AuthorizeReques
         }
         params.extend_pairs(query.forwarded);
     }
-    found(upstream.as_str())
+    found(authorization_endpoint.as_str())
 }
 
-async fn callback(state: &AppState, instance: &Instance, query: CallbackRequest) -> Response {
-    let flow = match unseal_postcard::<FlowEnvelope>(state, instance, &query.state) {
-        Ok(value)
-            if value.instance_key == instance.key.as_str() && fresh(value.issued_at, FLOW_TTL) =>
-        {
-            value
-        }
+async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest) -> Response {
+    let flow = match unseal_postcard::<FlowEnvelope>(state, &upstream.key, &query.state) {
+        Ok(value) if fresh(value.issued_at, FLOW_TTL) => value,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let relay_key = match ResourceKey::new(&flow.relay_key) {
+        Ok(key) => key,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let relay = match state.resolver.resolve_relay(&relay_key).await {
+        Ok(Some(relay)) if relay.upstream == upstream.key => relay,
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
     let mut redirect = match Url::parse(&flow.app_redirect_uri) {
-        Ok(url) if instance.redirect_allowed(&url) => url,
+        Ok(url) if relay.redirect_allowed(&url) => url,
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
     if query.error {
@@ -478,20 +519,20 @@ async fn callback(state: &AppState, instance: &Instance, query: CallbackRequest)
     let Some(code) = query.code else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let endpoints = match resolve_endpoints(state, instance).await {
+    let endpoints = match resolve_endpoints(state, upstream).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
-    let callback = callback_url(&state.cfg.public_url, &instance.key);
-    let upstream = match state
+    let callback = callback_url(&state.cfg.public_url, &upstream.key);
+    let upstream_response = match state
         .cfg
         .http
         .post(endpoints.token_endpoint)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("client_id", instance.upstream.client_id.as_str()),
-            ("client_secret", instance.upstream.client_secret.expose()),
+            ("client_id", upstream.client_id.as_str()),
+            ("client_secret", upstream.client_secret.expose()),
             ("redirect_uri", callback.as_str()),
             ("code_verifier", flow.upstream_pkce_verifier.as_str()),
         ])
@@ -501,18 +542,18 @@ async fn callback(state: &AppState, instance: &Instance, query: CallbackRequest)
         Ok(response) => response,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let status = upstream.status().as_u16();
-    let content_type = upstream
+    let status = upstream_response.status().as_u16();
+    let content_type = upstream_response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .map(str::to_owned);
-    let body = match upstream.bytes().await {
+    let body = match upstream_response.bytes().await {
         Ok(body) => body.to_vec(),
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
     let envelope = CodeEnvelope {
-        instance_key: instance.key.to_string(),
+        relay_key: relay.key.to_string(),
         envelope_id: random_array(),
         issued_at: unix_now(),
         redirect_uri: flow.app_redirect_uri,
@@ -523,12 +564,12 @@ async fn callback(state: &AppState, instance: &Instance, query: CallbackRequest)
             body,
         },
     };
-    let sealed = match seal_postcard(state, instance, &envelope) {
+    let sealed = match seal_postcard(state, &relay.key, &envelope) {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
     if sealed.len() > 4096 {
-        tracing::warn!(instance = %instance.key, size = sealed.len(), "sealed authorization code may exceed URL limits");
+        tracing::warn!(relay = %relay.key, size = sealed.len(), "sealed authorization code may exceed URL limits");
     }
     redirect.query_pairs_mut().append_pair("code", &sealed);
     redirect.query_pairs_mut().extend_pairs(query.forwarded);
@@ -538,8 +579,13 @@ async fn callback(state: &AppState, instance: &Instance, query: CallbackRequest)
     found(redirect.as_str())
 }
 
-async fn token(state: &AppState, instance: &Instance, request: Request<Body>) -> Response {
-    let origin = allowed_cors_origin(instance, request.headers());
+async fn token(
+    state: &AppState,
+    relay: &Relay,
+    upstream: &Upstream,
+    request: Request<Body>,
+) -> Response {
+    let origin = allowed_cors_origin(relay, request.headers());
     let bytes = match axum::body::to_bytes(request.into_body(), 1024 * 1024).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -562,7 +608,7 @@ async fn token(state: &AppState, instance: &Instance, request: Request<Body>) ->
             )
         }
     };
-    let auth_result = authenticate(state, instance, &form).await;
+    let auth_result = authenticate(state, relay, upstream, &form).await;
     if auth_result.is_err() {
         return with_cors(
             oauth_error(
@@ -574,8 +620,8 @@ async fn token(state: &AppState, instance: &Instance, request: Request<Body>) ->
         );
     }
     let response = match form.grant_type.as_str() {
-        "authorization_code" => exchange_sealed_code(state, instance, &form).await,
-        "refresh_token" => refresh(state, instance, &form).await,
+        "authorization_code" => exchange_sealed_code(state, relay, &form).await,
+        "refresh_token" => refresh(state, relay, upstream, &form).await,
         _ => oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
@@ -585,11 +631,7 @@ async fn token(state: &AppState, instance: &Instance, request: Request<Body>) ->
     with_cors(response, origin)
 }
 
-async fn exchange_sealed_code(
-    state: &AppState,
-    instance: &Instance,
-    form: &TokenRequest,
-) -> Response {
+async fn exchange_sealed_code(state: &AppState, relay: &Relay, form: &TokenRequest) -> Response {
     let Some(code) = &form.code else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -597,10 +639,8 @@ async fn exchange_sealed_code(
             "code is required",
         );
     };
-    let envelope = match unseal_postcard::<CodeEnvelope>(state, instance, code) {
-        Ok(value)
-            if value.instance_key == instance.key.as_str() && fresh(value.issued_at, CODE_TTL) =>
-        {
+    let envelope = match unseal_postcard::<CodeEnvelope>(state, &relay.key, code) {
+        Ok(value) if value.relay_key == relay.key.as_str() && fresh(value.issued_at, CODE_TTL) => {
             value
         }
         _ => {
@@ -640,7 +680,7 @@ async fn exchange_sealed_code(
                 "PKCE verification failed",
             );
         }
-    } else if matches!(instance.client_auth, ClientAuth::Public) {
+    } else if matches!(relay.client_auth, ClientAuth::Public) {
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -663,7 +703,12 @@ async fn exchange_sealed_code(
     stored_response(envelope.upstream_response)
 }
 
-async fn refresh(state: &AppState, instance: &Instance, form: &TokenRequest) -> Response {
+async fn refresh(
+    state: &AppState,
+    relay: &Relay,
+    upstream: &Upstream,
+    form: &TokenRequest,
+) -> Response {
     if form.refresh_token.is_none() {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -674,7 +719,7 @@ async fn refresh(state: &AppState, instance: &Instance, form: &TokenRequest) -> 
     if form
         .scope
         .as_deref()
-        .is_some_and(|scope| !scope_allowed(instance, scope))
+        .is_some_and(|scope| !scope_allowed(relay, scope))
     {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -682,7 +727,7 @@ async fn refresh(state: &AppState, instance: &Instance, form: &TokenRequest) -> 
             "scope is not allowed",
         );
     }
-    let endpoints = match resolve_endpoints(state, instance).await {
+    let endpoints = match resolve_endpoints(state, upstream).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
@@ -697,10 +742,10 @@ async fn refresh(state: &AppState, instance: &Instance, form: &TokenRequest) -> 
         })
         .cloned()
         .collect();
-    upstream_form.push(("client_id".into(), instance.upstream.client_id.clone()));
+    upstream_form.push(("client_id".into(), upstream.client_id.clone()));
     upstream_form.push((
         "client_secret".into(),
-        instance.upstream.client_secret.expose().to_owned(),
+        upstream.client_secret.expose().to_owned(),
     ));
     match state
         .cfg
@@ -721,10 +766,25 @@ async fn refresh(state: &AppState, instance: &Instance, form: &TokenRequest) -> 
 
 async fn authenticate(
     state: &AppState,
-    instance: &Instance,
+    relay: &Relay,
+    upstream: &Upstream,
     form: &TokenRequest,
 ) -> Result<(), ()> {
-    match &instance.client_auth {
+    match &relay.client_auth {
+        ClientAuth::UpstreamClient => {
+            let id = form.client_id.as_deref().unwrap_or_default();
+            let secret = form.client_secret.as_deref().unwrap_or_default();
+            if constant_eq(id.as_bytes(), upstream.client_id.as_bytes())
+                & constant_eq(
+                    secret.as_bytes(),
+                    upstream.client_secret.expose().as_bytes(),
+                )
+            {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
         ClientAuth::Public => Ok(()),
         ClientAuth::ClientSecret {
             client_id,
@@ -748,14 +808,14 @@ async fn authenticate(
                 return Err(());
             }
             let assertion = form.client_assertion.as_deref().ok_or(())?;
-            verify_private_key_jwt(state, instance, client_id, jwks, assertion).await
+            verify_private_key_jwt(state, relay, client_id, jwks, assertion).await
         }
     }
 }
 
 async fn verify_private_key_jwt(
     state: &AppState,
-    instance: &Instance,
+    relay: &Relay,
     client_id: &str,
     source: &ClientJwks,
     assertion: &str,
@@ -800,7 +860,7 @@ async fn verify_private_key_jwt(
     {
         return Err(());
     }
-    let audience = token_url(&state.cfg.public_url, &instance.key).to_string();
+    let audience = token_url(&state.cfg.public_url, &relay.key).to_string();
     let aud_ok = claims.get("aud").is_some_and(|aud| match aud {
         Value::String(value) => value == &audience,
         Value::Array(values) => values.iter().any(|value| value.as_str() == Some(&audience)),
@@ -809,29 +869,28 @@ async fn verify_private_key_jwt(
     aud_ok.then_some(()).ok_or(())
 }
 
-async fn discovery(state: &AppState, instance: &Instance) -> Response {
-    let upstream = discovery_url(&instance.upstream.issuer_url);
-    let mut doc = if instance.upstream.authorization_endpoint.is_some()
-        && instance.upstream.token_endpoint.is_some()
+async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Response {
+    let discovery = discovery_url(&upstream.issuer_url);
+    let mut doc = if upstream.authorization_endpoint.is_some() && upstream.token_endpoint.is_some()
     {
         json!({})
     } else {
-        match cached_json(state, &upstream, DISCOVERY_TTL).await {
+        match cached_json(state, &discovery, DISCOVERY_TTL).await {
             Ok(value) => value,
             Err(status) => return status.into_response(),
         }
     };
-    let endpoints = match resolve_endpoints_from_doc(instance, &doc) {
+    let endpoints = match resolve_endpoints_from_doc(upstream, &doc) {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
-    let base = instance_base_url(&state.cfg.public_url, &instance.key);
+    let base = relay_base_url(&state.cfg.public_url, &relay.key);
     let issuer = doc
         .get("issuer")
         .and_then(Value::as_str)
         .map(str::to_owned)
         .unwrap_or_else(|| {
-            let issuer = &instance.upstream.issuer_url;
+            let issuer = &upstream.issuer_url;
             if issuer.path() == "/" {
                 issuer.as_str().trim_end_matches('/').to_owned()
             } else {
@@ -849,8 +908,8 @@ async fn discovery(state: &AppState, instance: &Instance) -> Response {
     Json(doc).into_response()
 }
 
-async fn jwks(state: &AppState, instance: &Instance) -> Response {
-    let endpoints = match resolve_endpoints(state, instance).await {
+async fn jwks(state: &AppState, upstream: &Upstream) -> Response {
+    let endpoints = match resolve_endpoints(state, upstream).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
@@ -871,24 +930,17 @@ struct ResolvedEndpoints {
 
 async fn resolve_endpoints(
     state: &AppState,
-    instance: &Instance,
+    upstream: &Upstream,
 ) -> Result<ResolvedEndpoints, StatusCode> {
-    if instance.upstream.authorization_endpoint.is_some()
-        && instance.upstream.token_endpoint.is_some()
-    {
-        return resolve_endpoints_from_doc(instance, &json!({}));
+    if upstream.authorization_endpoint.is_some() && upstream.token_endpoint.is_some() {
+        return resolve_endpoints_from_doc(upstream, &json!({}));
     }
-    let doc = cached_json(
-        state,
-        &discovery_url(&instance.upstream.issuer_url),
-        DISCOVERY_TTL,
-    )
-    .await?;
-    resolve_endpoints_from_doc(instance, &doc)
+    let doc = cached_json(state, &discovery_url(&upstream.issuer_url), DISCOVERY_TTL).await?;
+    resolve_endpoints_from_doc(upstream, &doc)
 }
 
 fn resolve_endpoints_from_doc(
-    instance: &Instance,
+    upstream: &Upstream,
     doc: &Value,
 ) -> Result<ResolvedEndpoints, StatusCode> {
     let url_field = |name: &str| {
@@ -896,23 +948,17 @@ fn resolve_endpoints_from_doc(
             .and_then(Value::as_str)
             .and_then(|s| Url::parse(s).ok())
     };
-    let authorization_endpoint = instance
-        .upstream
+    let authorization_endpoint = upstream
         .authorization_endpoint
         .clone()
         .or_else(|| url_field("authorization_endpoint"))
         .ok_or(StatusCode::BAD_GATEWAY)?;
-    let token_endpoint = instance
-        .upstream
+    let token_endpoint = upstream
         .token_endpoint
         .clone()
         .or_else(|| url_field("token_endpoint"))
         .ok_or(StatusCode::BAD_GATEWAY)?;
-    let jwks_uri = instance
-        .upstream
-        .jwks_uri
-        .clone()
-        .or_else(|| url_field("jwks_uri"));
+    let jwks_uri = upstream.jwks_uri.clone().or_else(|| url_field("jwks_uri"));
     Ok(ResolvedEndpoints {
         authorization_endpoint,
         token_endpoint,
@@ -976,21 +1022,21 @@ fn stored_response(stored: StoredResponse) -> Response {
     response.body(Body::from(stored.body)).unwrap()
 }
 
-fn preflight(instance: &Instance, headers: &HeaderMap) -> Response {
-    let origin = allowed_cors_origin(instance, headers);
+fn preflight(relay: &Relay, headers: &HeaderMap) -> Response {
+    let origin = allowed_cors_origin(relay, headers);
     if origin.is_none() {
         return StatusCode::FORBIDDEN.into_response();
     }
     with_cors(StatusCode::NO_CONTENT.into_response(), origin)
 }
 
-fn allowed_cors_origin(instance: &Instance, headers: &HeaderMap) -> Option<HeaderValue> {
+fn allowed_cors_origin(relay: &Relay, headers: &HeaderMap) -> Option<HeaderValue> {
     let value = headers.get(header::ORIGIN)?;
     let url = Url::parse(value.to_str().ok()?).ok()?;
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
         return None;
     }
-    if instance.redirect_allowed(&url) {
+    if relay.redirect_allowed(&url) {
         Some(value.clone())
     } else {
         None
@@ -1031,31 +1077,31 @@ fn found(location: &str) -> Response {
 
 fn seal_postcard<T: Serialize>(
     state: &AppState,
-    instance: &Instance,
+    key: &ResourceKey,
     value: &T,
 ) -> Result<String, StatusCode> {
     let bytes = postcard::to_stdvec(value).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     state
         .cfg
         .sealer
-        .seal(&bytes, instance.key.as_str().as_bytes())
+        .seal(&bytes, key.as_str().as_bytes())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn unseal_postcard<T: for<'de> Deserialize<'de>>(
     state: &AppState,
-    instance: &Instance,
+    key: &ResourceKey,
     value: &str,
 ) -> Result<T, ()> {
     let bytes = state
         .cfg
         .sealer
-        .unseal(value, instance.key.as_str().as_bytes())
+        .unseal(value, key.as_str().as_bytes())
         .map_err(|_| ())?;
     postcard::from_bytes(&bytes).map_err(|_| ())
 }
 
-fn instance_base_url(public_url: &Url, key: &InstanceKey) -> Url {
+fn relay_base_url(public_url: &Url, key: &ResourceKey) -> Url {
     let mut url = public_url.clone();
     url.set_path(&format!(
         "{}/oidc/{}/",
@@ -1067,12 +1113,20 @@ fn instance_base_url(public_url: &Url, key: &InstanceKey) -> Url {
     url
 }
 
-fn callback_url(public_url: &Url, key: &InstanceKey) -> Url {
-    instance_base_url(public_url, key).join("callback").unwrap()
+fn callback_url(public_url: &Url, key: &ResourceKey) -> Url {
+    let mut url = public_url.clone();
+    url.set_path(&format!(
+        "{}/oidc/upstreams/{}/callback",
+        public_url.path().trim_end_matches('/'),
+        key
+    ));
+    url.set_query(None);
+    url.set_fragment(None);
+    url
 }
 
-fn token_url(public_url: &Url, key: &InstanceKey) -> Url {
-    instance_base_url(public_url, key).join("token").unwrap()
+fn token_url(public_url: &Url, key: &ResourceKey) -> Url {
+    relay_base_url(public_url, key).join("token").unwrap()
 }
 
 fn discovery_url(issuer: &Url) -> Url {

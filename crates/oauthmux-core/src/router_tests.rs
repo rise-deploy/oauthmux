@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-    ClientAuth, InstanceMap, MemoryReplayCache, Origin, SecretString, UpstreamSpec, XChaChaSealer,
+    ClientAuth, MemoryReplayCache, Origin, ProviderSnapshot, SecretString, Upstream, XChaChaSealer,
 };
 use axum::{
     body::Body,
@@ -288,27 +288,30 @@ async fn setup_signed_profile(
             },
         ),
     };
-    let key = InstanceKey::new("profile").unwrap();
-    let instance = Arc::new(Instance {
+    let key = ResourceKey::new("profile").unwrap();
+    let upstream = Arc::new(Upstream {
         key: key.clone(),
-        upstream: UpstreamSpec {
-            issuer_url: base,
-            authorization_endpoint: None,
-            token_endpoint: None,
-            jwks_uri: None,
-            client_id: "upstream-client".into(),
-            client_secret: SecretString::new("upstream-secret"),
-            scopes: vec!["openid".into(), "email".into(), "profile".into()],
-            allowed_scopes: Some(vec!["openid".into(), "email".into(), "profile".into()]),
-        },
+        issuer_url: base,
+        authorization_endpoint: None,
+        token_endpoint: None,
+        jwks_uri: None,
+        client_id: "upstream-client".into(),
+        client_secret: SecretString::new("upstream-secret"),
+    });
+    let relay = Arc::new(Relay {
+        key: key.clone(),
+        upstream: key.clone(),
         client_auth: client_auth.clone(),
+        scopes: vec!["openid".into(), "email".into(), "profile".into()],
+        allowed_scopes: Some(vec!["openid".into(), "email".into(), "profile".into()]),
         allowed_redirect_origins: vec![Origin::parse(redirect_origin).unwrap()],
         default_redirect_uri: Some(Url::parse(redirect_uri).unwrap()),
     });
-    let mut instances = InstanceMap::new();
-    instances.insert(key, instance);
+    let mut resources = ProviderSnapshot::default();
+    resources.upstreams.insert(key.clone(), upstream);
+    resources.relays.insert(key, relay);
     let app = router(
-        Arc::new(instances),
+        Arc::new(resources),
         MuxConfig {
             public_url: Url::parse("https://mux.example/").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[8_u8; 32], None).unwrap()),
@@ -356,31 +359,34 @@ async fn setup_with_capture(
         });
     let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
 
-    let key = InstanceKey::new(key).unwrap();
+    let key = ResourceKey::new(key).unwrap();
     let authorization_endpoint = explicit_endpoints.then(|| base.join("authorize").unwrap());
     let token_endpoint = explicit_endpoints.then(|| base.join("token").unwrap());
     let jwks_uri = explicit_endpoints.then(|| base.join("jwks").unwrap());
-    let instance = Arc::new(Instance {
+    let upstream = Arc::new(Upstream {
         key: key.clone(),
-        upstream: UpstreamSpec {
-            issuer_url: base,
-            authorization_endpoint,
-            token_endpoint,
-            jwks_uri,
-            client_id: "upstream-client".into(),
-            client_secret: SecretString::new("upstream-secret"),
-            scopes: vec!["openid".into(), "email".into()],
-            allowed_scopes,
-        },
+        issuer_url: base,
+        authorization_endpoint,
+        token_endpoint,
+        jwks_uri,
+        client_id: "upstream-client".into(),
+        client_secret: SecretString::new("upstream-secret"),
+    });
+    let relay = Arc::new(Relay {
+        key: key.clone(),
+        upstream: key.clone(),
         client_auth: auth,
+        scopes: vec!["openid".into(), "email".into()],
+        allowed_scopes,
         allowed_redirect_origins: vec![Origin::parse("https://app.example").unwrap()],
         default_redirect_uri: Some(Url::parse("https://app.example/callback").unwrap()),
     });
-    let mut instances = InstanceMap::new();
-    instances.insert(key, instance);
+    let mut resources = ProviderSnapshot::default();
+    resources.upstreams.insert(key.clone(), upstream);
+    resources.relays.insert(key, relay);
     let sealer = Arc::new(XChaChaSealer::new(&[7_u8; 32], None).unwrap());
     let app = router(
-        Arc::new(instances),
+        Arc::new(resources),
         MuxConfig {
             public_url: Url::parse("https://mux.example/").unwrap(),
             sealer: sealer.clone(),
@@ -400,6 +406,71 @@ async fn response_body(response: Response) -> Vec<u8> {
         .unwrap()
         .to_bytes()
         .to_vec()
+}
+
+#[tokio::test]
+async fn relays_sharing_an_upstream_use_one_provider_callback() {
+    let upstream_key = ResourceKey::new("google").unwrap();
+    let upstream = Arc::new(Upstream {
+        key: upstream_key.clone(),
+        issuer_url: Url::parse("https://issuer.example").unwrap(),
+        authorization_endpoint: Some(Url::parse("https://issuer.example/authorize").unwrap()),
+        token_endpoint: Some(Url::parse("https://issuer.example/token").unwrap()),
+        jwks_uri: None,
+        client_id: "upstream-client".into(),
+        client_secret: SecretString::new("upstream-secret"),
+    });
+    let mut resources = ProviderSnapshot::default();
+    resources.upstreams.insert(upstream_key.clone(), upstream);
+    for name in ["pool-a", "pool-b"] {
+        let key = ResourceKey::new(name).unwrap();
+        resources.relays.insert(
+            key.clone(),
+            Arc::new(Relay {
+                key,
+                upstream: upstream_key.clone(),
+                client_auth: ClientAuth::Public,
+                scopes: vec!["openid".into()],
+                allowed_scopes: None,
+                allowed_redirect_origins: vec![Origin::parse("https://app.example").unwrap()],
+                default_redirect_uri: None,
+            }),
+        );
+    }
+    let app = router(
+        Arc::new(resources),
+        MuxConfig {
+            public_url: Url::parse("https://mux.example/").unwrap(),
+            sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
+            replay_cache: None,
+            http: reqwest::Client::new(),
+        },
+        KeyStrategy::SingleSegment,
+    );
+    let challenge = pkce_challenge("shared-upstream-callback-test-verifier-with-enough-characters");
+
+    for relay in ["pool-a", "pool-b"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!(
+                    "/oidc/{relay}/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        assert_eq!(
+            location
+                .query_pairs()
+                .find(|(name, _)| name == "redirect_uri")
+                .unwrap()
+                .1,
+            "https://mux.example/oidc/upstreams/google/callback"
+        );
+    }
 }
 
 async fn authorization_code(app: &Router, path_key: &str, challenge: Option<&str>) -> String {
@@ -568,7 +639,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
     ).await.unwrap();
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     let expired = CodeEnvelope {
-        instance_key: "google".into(),
+        relay_key: "google".into(),
         envelope_id: [9; 16],
         issued_at: unix_now() - CODE_TTL - 1,
         redirect_uri: "https://app.example/callback".into(),
@@ -595,7 +666,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
     );
 
     let expired_flow = FlowEnvelope {
-        instance_key: "google".into(),
+        relay_key: "google".into(),
         app_redirect_uri: "https://app.example/callback".into(),
         app_state: None,
         upstream_pkce_verifier: "upstream-verifier".into(),
@@ -610,9 +681,11 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
     let callback = app
         .clone()
         .oneshot(
-            Request::get(format!("/oidc/google/callback?code=upstream&state={state}"))
-                .body(Body::empty())
-                .unwrap(),
+            Request::get(format!(
+                "/oidc/upstreams/google/callback?code=upstream&state={state}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -645,7 +718,7 @@ async fn upstream_authorization_errors_relay_only_to_validated_redirect() {
     let response = app
         .oneshot(
             Request::get(format!(
-                "/oidc/google/callback?error=access_denied&error_description=declined&error_uri=https%3A%2F%2Fissuer.example%2Ferrors%2Fdenied&state={state}"
+                "/oidc/upstreams/google/callback?error=access_denied&error_description=declined&error_uri=https%3A%2F%2Fissuer.example%2Ferrors%2Fdenied&state={state}"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -839,6 +912,10 @@ async fn run_signed_relay_profile(profile: RelayProfile) {
         ("redirect_uri", redirect_uri.as_str()),
     ];
     match client_auth {
+        ClientAuth::UpstreamClient => {
+            token_form.push(("client_id", "upstream-client"));
+            token_form.push(("client_secret", "upstream-secret"));
+        }
         ClientAuth::Public => token_form.push(("code_verifier", verifier)),
         ClientAuth::ClientSecret { .. } => {
             token_form.push(("client_id", "upstream-client"));

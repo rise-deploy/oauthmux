@@ -87,17 +87,32 @@ async fn dex_authorization_code_and_refresh_flow() {
     std::fs::write(
         &config_path,
         format!(
-            r#"instances:
-  dex:
-    issuer_url: {DEX_ISSUER}
-    client_id: oauthmux-e2e
-    client_secret: oauthmux-e2e-secret
-    scopes: [openid, email, profile, offline_access]
-    allowed_scopes: [openid, email, profile, offline_access]
-    allowed_redirect_origins: [http://127.0.0.1:19090]
-    default_redirect_uri: {APP_CALLBACK}
-    client_auth:
-      mode: public
+            r#"apiVersion: oauthmux.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: dex
+spec:
+  issuerUrl: {DEX_ISSUER}
+  oauthClient:
+    clientId: oauthmux-e2e
+    clientSecret:
+      value: oauthmux-e2e-secret
+---
+apiVersion: oauthmux.dev/v1alpha1
+kind: Relay
+metadata:
+  name: dex
+spec:
+  upstreamRef:
+    name: dex
+  scopes:
+    default: [openid, email, profile, offline_access]
+    allowed: [openid, email, profile, offline_access]
+  clientAuthentication:
+    type: Public
+  redirectPolicy:
+    allowedOrigins: [http://127.0.0.1:19090]
+    defaultRedirectUri: {APP_CALLBACK}
 "#
         ),
     )

@@ -84,7 +84,7 @@ input][cognito-oidc-idp] specifically for non-typical endpoint paths and alterna
 
 Cognito sends the client credentials with `client_secret_post`, which matches oauthmux's
 shared-secret client authentication. The Cognito `/oauth2/idpresponse` origin must be in the
-instance's redirect allow-list. oauthmux forwards the [Cognito-generated nonce][cognito-id-token]
+relay's redirect allow-list. oauthmux forwards the [Cognito-generated nonce][cognito-id-token]
 to the upstream issuer without changing it, so Cognito can validate the nonce in the returned
 upstream ID token.
 
@@ -99,6 +99,8 @@ upstream ID token.
 ```console
 mise install
 mise run check
+mise run docs:serve
+mise run schema
 ```
 
 The Docker-backed suite runs a complete browserless authorization-code and refresh flow against a
@@ -120,17 +122,34 @@ Provider crates depend on `oauthmux-core`; the core has no provider-specific dep
 Create `config.yaml`:
 
 ```yaml
-instances:
-  google:
-    issuer_url: https://accounts.google.com
-    client_id: 1234.apps.googleusercontent.com
-    client_secret: ${GOOGLE_SECRET}
-    scopes: [openid, email, profile]
-    allowed_scopes: [openid, email, profile]
-    allowed_redirect_origins: [https://app.example.com]
-    default_redirect_uri: https://app.example.com/oauth/callback
-    client_auth:
-      mode: public
+apiVersion: oauthmux.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  oauthClient:
+    clientId: 1234.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_SECRET
+---
+apiVersion: oauthmux.dev/v1alpha1
+kind: Relay
+metadata:
+  name: google
+spec:
+  upstreamRef:
+    name: google
+  scopes:
+    default: [openid, email, profile]
+    allowed: [openid, email, profile]
+  clientAuthentication:
+    type: Public
+  redirectPolicy:
+    allowedOrigins: [https://app.example.com]
+    defaultRedirectUri: https://app.example.com/oauth/callback
 ```
 
 Then start the server:
@@ -144,25 +163,26 @@ cargo run -p oauthmux
 ```
 
 The stable callback registered with the upstream provider is
-`https://auth.example.com/oidc/google/callback`. Applications route authorization and token
+`https://auth.example.com/oidc/upstreams/google/callback`. Applications route authorization and token
 requests through the corresponding endpoints under `/oidc/google/` and retain the upstream
 issuer, JWKS, and UserInfo endpoints as their trust configuration.
 
-The File provider accepts either `client_secret` or `client_secret_file`, exactly one per
-instance. A value whose complete form is `${VAR}` is resolved from the process environment.
-Invalid reloads retain the last valid snapshot.
+The File provider reads a multi-document YAML resource stream. Secret fields accept one explicit
+`value`, `valueFrom.env`, or `valueFrom.file` source. Relative files resolve from the configuration
+file's directory. Invalid reloads retain the complete last valid snapshot.
 
-`scopes` supplies the upstream scope when an authorization request omits `scope`. A supplied
-scope is forwarded unchanged. Optional `allowed_scopes` restricts both configured defaults and
-requested scopes; omitting it leaves scope authorization to the upstream provider.
+`scopes.default` supplies the upstream scope when an authorization request omits `scope`. A
+supplied scope is forwarded unchanged. Optional `scopes.allowed` restricts both configured
+defaults and requested scopes; omitting it leaves scope authorization to the upstream provider.
 
 ## SSM provider
 
-Set `OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/instances/`. Each recursive child parameter is one
-instance, and its value is the YAML or JSON shape inside a File provider's instance entry.
-Parameters are requested with decryption. `client_secret` is expected directly in the parameter;
-`client_secret_file` is invalid for this provider. One malformed parameter is omitted without
-preventing valid parameters from entering the snapshot.
+Set `OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/`. Full resource documents use the SSM `String` type
+at `/oauthmux/upstreams/{name}` and `/oauthmux/relays/{name}`. The parameter path must agree with
+the document's kind and name. Secret fields reference either an exact SSM `SecureString` parameter
+with `valueFrom.ssmParameter` or an AWS Secrets Manager `SecretString` with
+`valueFrom.secretsManager`. Optional `jsonKey` selects one top-level string field from a JSON
+Secrets Manager value.
 
 A runtime role needs permissions equivalent to:
 
@@ -173,7 +193,21 @@ A runtime role needs permissions equivalent to:
     {
       "Effect": "Allow",
       "Action": "ssm:GetParametersByPath",
-      "Resource": "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/instances/*"
+      "Resource": [
+        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/upstreams/*",
+        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/relays/*",
+        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/brokers/*"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/secrets/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:oauthmux/*"
     },
     {
       "Effect": "Allow",
@@ -184,9 +218,11 @@ A runtime role needs permissions equivalent to:
 }
 ```
 
-AWS region and credentials use the standard AWS SDK provider chain. When File and SSM both
-contain an instance key, provider configuration order is deterministic: File is first, the
-collision is logged, and the File instance remains active.
+AWS region and credentials use the standard AWS SDK provider chain. When File and SSM contain the
+same resource kind and name, provider configuration order is deterministic: File is first, the
+collision is logged, and the File resource remains active.
+
+Run `oauthmux schema` to print the JSON Schema generated from the Rust resource types.
 
 ## Runtime configuration
 
@@ -197,7 +233,7 @@ collision is logged, and the File instance remains active.
 | `OAUTHMUX_SEAL_KEY_PREVIOUS` | Previous 32-byte key accepted during rotation | unset |
 | `OAUTHMUX_LISTEN` | Native server socket | `0.0.0.0:8080` |
 | `OAUTHMUX_PROVIDER_FILE` | File provider YAML path | disabled |
-| `OAUTHMUX_PROVIDER_FILE_POLL` | File mtime poll interval | `30s` |
+| `OAUTHMUX_PROVIDER_FILE_POLL` | File and referenced-secret reload interval | `30s` |
 | `OAUTHMUX_PROVIDER_SSM_PREFIX` | SSM hierarchy ending in `/` | disabled |
 | `OAUTHMUX_PROVIDER_SSM_POLL` | SSM poll interval | `60s` |
 | `OAUTHMUX_LAMBDA_CONFIG_TTL` | Maximum age before an invocation refreshes provider snapshots | `60s` |
@@ -224,13 +260,14 @@ above. The Docker image contains the Lambda Runtime API client through the binar
 
 ## Client authentication
 
-`client_auth.mode` accepts:
+`Relay.spec.clientAuthentication.type` accepts:
 
-- `public`: application PKCE is mandatory and only `S256` is accepted.
-- `client_secret`: `client_id` and `client_secret` form fields are checked in constant time.
-- `private_key_jwt`: `client_id`, `client_assertion_type`, and `client_assertion` are required.
+- `UpstreamClient`: application credentials must match the referenced upstream OAuth client.
+- `Public`: application PKCE is mandatory and only `S256` is accepted.
+- `ClientSecret`: `client_id` and `client_secret` form fields are checked in constant time.
+- `PrivateKeyJwt`: `client_id`, `client_assertion_type`, and `client_assertion` are required.
   `jwks` is either an inline JWKS object or an HTTPS URL. The assertion issuer and subject equal
-  the client ID, its audience equals the instance's proxy token endpoint, and its signature and
+  the client ID, its audience equals the relay's proxy token endpoint, and its signature and
   expiration must validate.
 
 Redirect targets require an exact configured HTTP(S) origin. HTTP loopback targets on
@@ -252,7 +289,7 @@ credentials. Token and refresh response status, content type, and body bytes rem
 
 ## Known gaps
 
-- Instance-level relay/broker selection is not implemented. Transparent relay requires a relying
+- `Broker` resources are rejected because brokered issuer execution is not implemented. Transparent relay requires a relying
   party that supports manual endpoint configuration because standard OIDC discovery does not
   allow a metadata URL hosted by oauthmux to identify the upstream issuer.
 - Brokered issuer requires upstream-token validation, downstream token issuance, an oauthmux-owned
@@ -281,8 +318,8 @@ intermediary URL limits can reject them.
 
 ## Embedding
 
-`oauthmux-core` exports `InstanceResolver`, `MuxConfig`, `KeyStrategy`, and `router`. Resolution is
+`oauthmux-core` exports `ResourceResolver`, `MuxConfig`, `KeyStrategy`, and `router`. Resolution is
 performed for every request, so a database-backed host can expose live configuration directly.
-`KeyStrategy::TwoSegment` maps `/oidc/{project}/{extension}/...` to the instance key
+`KeyStrategy::TwoSegment` maps `/oidc/{project}/{extension}/...` to the relay key
 `{project}/{extension}`. The crate-level documentation contains a compiling HashMap-backed mount
 example.

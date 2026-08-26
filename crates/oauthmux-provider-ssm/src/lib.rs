@@ -1,21 +1,27 @@
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use oauthmux_core::{
-    ClientAuth, ClientJwks, ConfigProvider, Instance, InstanceKey, Origin, ProviderSnapshot,
-    SecretString, UpstreamSpec,
+    compile_resources, ConfigProvider, ProviderSnapshot, ResourceDocument, SecretResolver,
+    SecretSource, SecretString,
 };
-use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
-use url::Url;
 
-pub const DEFAULT_PREFIX: &str = "/oauthmux/instances/";
+pub const DEFAULT_PREFIX: &str = "/oauthmux/";
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParameterType {
+    String,
+    SecureString,
+    StringList,
+}
 
 #[derive(Clone, Debug)]
 pub struct Parameter {
     pub name: String,
     pub value: String,
+    pub parameter_type: ParameterType,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -31,6 +37,13 @@ pub trait SsmClient: Send + Sync + 'static {
         path: &str,
         next_token: Option<String>,
     ) -> anyhow::Result<ParameterPage>;
+
+    async fn get_parameter(&self, name: &str) -> anyhow::Result<Option<Parameter>>;
+}
+
+#[async_trait]
+pub trait SecretsManagerClient: Send + Sync + 'static {
+    async fn get_secret_string(&self, secret_id: &str) -> anyhow::Result<Option<String>>;
 }
 
 #[cfg(feature = "aws")]
@@ -57,29 +70,81 @@ impl SsmClient for AwsSsmClient {
         let parameters = output
             .parameters()
             .iter()
-            .filter_map(|parameter| {
-                Some(Parameter {
-                    name: parameter.name()?.to_owned(),
-                    value: parameter.value()?.to_owned(),
-                })
-            })
+            .filter_map(convert_parameter)
             .collect();
         Ok(ParameterPage {
             parameters,
             next_token: output.next_token().map(str::to_owned),
         })
     }
+
+    async fn get_parameter(&self, name: &str) -> anyhow::Result<Option<Parameter>> {
+        let output = self
+            .0
+            .get_parameter()
+            .name(name)
+            .with_decryption(true)
+            .send()
+            .await;
+        match output {
+            Ok(output) => Ok(output.parameter().and_then(convert_parameter)),
+            Err(error)
+                if error
+                    .as_service_error()
+                    .is_some_and(|error| error.is_parameter_not_found()) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error).context("GetParameter"),
+        }
+    }
 }
 
-pub struct SsmProvider<C> {
+#[cfg(feature = "aws")]
+fn convert_parameter(parameter: &aws_sdk_ssm::types::Parameter) -> Option<Parameter> {
+    use aws_sdk_ssm::types::ParameterType as AwsParameterType;
+    let parameter_type = match parameter.r#type()? {
+        AwsParameterType::String => ParameterType::String,
+        AwsParameterType::SecureString => ParameterType::SecureString,
+        AwsParameterType::StringList => ParameterType::StringList,
+        _ => return None,
+    };
+    Some(Parameter {
+        name: parameter.name()?.to_owned(),
+        value: parameter.value()?.to_owned(),
+        parameter_type,
+    })
+}
+
+#[cfg(feature = "aws")]
+pub struct AwsSecretsManagerClient(pub aws_sdk_secretsmanager::Client);
+
+#[cfg(feature = "aws")]
+#[async_trait]
+impl SecretsManagerClient for AwsSecretsManagerClient {
+    async fn get_secret_string(&self, secret_id: &str) -> anyhow::Result<Option<String>> {
+        let output = self
+            .0
+            .get_secret_value()
+            .secret_id(secret_id)
+            .send()
+            .await
+            .context("GetSecretValue")?;
+        Ok(output.secret_string().map(str::to_owned))
+    }
+}
+
+pub struct SsmProvider<C, S> {
     client: Arc<C>,
+    secrets_manager: Arc<S>,
     prefix: String,
     poll_interval: Duration,
 }
 
-impl<C> SsmProvider<C> {
+impl<C, S> SsmProvider<C, S> {
     pub fn new(
         client: Arc<C>,
+        secrets_manager: Arc<S>,
         prefix: impl Into<String>,
         poll_interval: Duration,
     ) -> anyhow::Result<Self> {
@@ -92,55 +157,59 @@ impl<C> SsmProvider<C> {
         }
         Ok(Self {
             client,
+            secrets_manager,
             prefix,
             poll_interval,
         })
     }
 }
 
-impl<C: SsmClient> SsmProvider<C> {
+impl<C: SsmClient, S: SecretsManagerClient> SsmProvider<C, S> {
     pub async fn load(&self) -> anyhow::Result<ProviderSnapshot> {
-        let mut snapshot = ProviderSnapshot::default();
-        let mut token = None;
-        loop {
-            let page = self
-                .client
-                .get_parameters_by_path(&self.prefix, token)
-                .await?;
-            for parameter in page.parameters {
-                let key_text = match parameter
-                    .name
-                    .strip_prefix(&self.prefix)
-                    .filter(|name| !name.is_empty())
-                {
-                    Some(value) => value,
-                    None => {
-                        tracing::error!(parameter = %parameter.name, "SSM parameter is outside the configured prefix");
-                        continue;
+        let mut documents = Vec::new();
+        for plural in ["upstreams", "relays", "brokers"] {
+            let path = format!("{}{plural}/", self.prefix);
+            let mut token = None;
+            loop {
+                let page = self.client.get_parameters_by_path(&path, token).await?;
+                for parameter in page.parameters {
+                    if parameter.parameter_type != ParameterType::String {
+                        return Err(anyhow!(
+                            "{}: resource documents must use the SSM String type",
+                            parameter.name
+                        ));
                     }
-                };
-                match parse_instance(key_text, &parameter.value) {
-                    Ok(instance) => {
-                        snapshot
-                            .instances
-                            .insert(instance.key.clone(), Arc::new(instance));
+                    let expected = expected_identity(&self.prefix, &parameter.name)?;
+                    let document: ResourceDocument = serde_yaml::from_str(&parameter.value)
+                        .with_context(|| format!("{}: parse resource document", parameter.name))?;
+                    if document.kind() != expected.0 || document.name() != expected.1 {
+                        return Err(anyhow!(
+                            "{}: path identifies {}/{}, document identifies {}/{}",
+                            parameter.name,
+                            expected.0,
+                            expected.1,
+                            document.kind(),
+                            document.name()
+                        ));
                     }
-                    Err(error) => {
-                        tracing::error!(parameter = %parameter.name, %error, "malformed SSM instance parameter; skipping instance");
-                    }
+                    documents.push(document);
+                }
+                token = page.next_token;
+                if token.is_none() {
+                    break;
                 }
             }
-            token = page.next_token;
-            if token.is_none() {
-                break;
-            }
         }
-        Ok(snapshot)
+        let resolver = AwsSecretResolver {
+            ssm: self.client.as_ref(),
+            secrets_manager: self.secrets_manager.as_ref(),
+        };
+        compile_resources(documents, &resolver).await
     }
 }
 
 #[async_trait]
-impl<C: SsmClient> ConfigProvider for SsmProvider<C> {
+impl<C: SsmClient, S: SecretsManagerClient> ConfigProvider for SsmProvider<C, S> {
     fn name(&self) -> &str {
         "ssm"
     }
@@ -161,7 +230,7 @@ impl<C: SsmClient> ConfigProvider for SsmProvider<C> {
                 }
                 Err(error) if !has_sent => return Err(error),
                 Err(error) => {
-                    tracing::error!(%error, "SSM poll failed; keeping last good snapshot")
+                    tracing::error!(%error, "SSM refresh failed; keeping last good snapshot")
                 }
             }
             tokio::time::sleep(self.poll_interval).await;
@@ -169,205 +238,427 @@ impl<C: SsmClient> ConfigProvider for SsmProvider<C> {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawInstance {
-    issuer_url: String,
-    #[serde(default)]
-    authorization_endpoint: Option<String>,
-    #[serde(default)]
-    token_endpoint: Option<String>,
-    #[serde(default)]
-    jwks_uri: Option<String>,
-    client_id: String,
-    client_secret: String,
-    #[serde(default)]
-    client_secret_file: Option<String>,
-    #[serde(default)]
-    scopes: Vec<String>,
-    #[serde(default)]
-    allowed_scopes: Option<Vec<String>>,
-    #[serde(default)]
-    allowed_redirect_origins: Vec<String>,
-    #[serde(default)]
-    default_redirect_uri: Option<String>,
-    client_auth: RawClientAuth,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-enum RawClientAuth {
-    Public,
-    ClientSecret {
-        client_id: String,
-        client_secret: String,
-    },
-    PrivateKeyJwt {
-        client_id: String,
-        jwks: serde_json::Value,
-    },
-}
-
-pub fn parse_instance(name: &str, document: &str) -> anyhow::Result<Instance> {
-    if name.contains('/') {
+fn expected_identity<'a>(prefix: &str, name: &'a str) -> anyhow::Result<(&'static str, &'a str)> {
+    let relative = name
+        .strip_prefix(prefix)
+        .ok_or_else(|| anyhow!("{name}: parameter is outside the configured prefix"))?;
+    let segments: Vec<_> = relative.split('/').collect();
+    if segments.len() != 2 || segments[1].is_empty() {
         return Err(anyhow!(
-            "key: SSM-provider instance keys must be one path segment"
+            "{name}: expected {prefix}{{upstreams|relays|brokers}}/{{name}}"
         ));
     }
-    let raw: RawInstance = serde_yaml::from_str(document).context("parse YAML/JSON")?;
-    if raw.client_secret_file.is_some() {
-        return Err(anyhow!(
-            "client_secret_file is not supported by the SSM provider"
-        ));
+    let kind = match segments[0] {
+        "upstreams" => "Upstream",
+        "relays" => "Relay",
+        "brokers" => return Err(anyhow!("{name}: Broker resources are not supported")),
+        _ => {
+            return Err(anyhow!(
+                "{name}: expected an upstreams, relays, or brokers resource path"
+            ))
+        }
+    };
+    Ok((kind, segments[1]))
+}
+
+struct AwsSecretResolver<'a, C, S> {
+    ssm: &'a C,
+    secrets_manager: &'a S,
+}
+
+#[async_trait]
+impl<C: SsmClient, S: SecretsManagerClient> SecretResolver for AwsSecretResolver<'_, C, S> {
+    async fn resolve_value(&self, _: &str) -> anyhow::Result<SecretString> {
+        Err(anyhow!(
+            "inline secret values are not supported by the SSM provider"
+        ))
     }
-    let key = InstanceKey::new(name).map_err(|e| anyhow!("key: {e}"))?;
-    let allowed_redirect_origins = raw
-        .allowed_redirect_origins
-        .iter()
-        .map(|value| Origin::parse(value).map_err(anyhow::Error::msg))
-        .collect::<anyhow::Result<Vec<_>>>()
-        .context("allowed_redirect_origins")?;
-    let client_auth = match raw.client_auth {
-        RawClientAuth::Public => ClientAuth::Public,
-        RawClientAuth::ClientSecret {
-            client_id,
-            client_secret,
-        } => ClientAuth::ClientSecret {
-            client_id,
-            client_secret: SecretString::new(client_secret),
-        },
-        RawClientAuth::PrivateKeyJwt { client_id, jwks } => ClientAuth::PrivateKeyJwt {
-            client_id,
-            jwks: match jwks {
-                serde_json::Value::String(value) => {
-                    ClientJwks::Url(Url::parse(&value).context("client_auth.jwks URL")?)
+
+    async fn resolve_source(&self, source: &SecretSource) -> anyhow::Result<SecretString> {
+        let value = match source {
+            SecretSource::SsmParameter { name } => {
+                if !name.starts_with('/') {
+                    return Err(anyhow!("SSM parameter name must be absolute"));
                 }
-                value => ClientJwks::Inline(value),
-            },
-        },
-    };
-    let instance = Instance {
-        key,
-        upstream: UpstreamSpec {
-            issuer_url: parse_url("issuer_url", &raw.issuer_url)?,
-            authorization_endpoint: parse_optional_url(
-                "authorization_endpoint",
-                raw.authorization_endpoint,
-            )?,
-            token_endpoint: parse_optional_url("token_endpoint", raw.token_endpoint)?,
-            jwks_uri: parse_optional_url("jwks_uri", raw.jwks_uri)?,
-            client_id: raw.client_id,
-            client_secret: SecretString::new(raw.client_secret),
-            scopes: raw.scopes,
-            allowed_scopes: raw.allowed_scopes,
-        },
-        client_auth,
-        allowed_redirect_origins,
-        default_redirect_uri: parse_optional_url("default_redirect_uri", raw.default_redirect_uri)?,
-    };
-    instance.validate().map_err(anyhow::Error::msg)?;
-    Ok(instance)
-}
-
-fn parse_url(field: &str, value: &str) -> anyhow::Result<Url> {
-    let url = Url::parse(value).with_context(|| field.to_owned())?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(anyhow!("{field}: must use http or https"));
+                let parameter = self
+                    .ssm
+                    .get_parameter(name)
+                    .await?
+                    .ok_or_else(|| anyhow!("referenced SSM parameter does not exist"))?;
+                if parameter.parameter_type != ParameterType::SecureString {
+                    return Err(anyhow!(
+                        "referenced SSM parameter must use the SecureString type"
+                    ));
+                }
+                parameter.value
+            }
+            SecretSource::SecretsManager {
+                secret_id,
+                json_key,
+            } => {
+                let secret = self
+                    .secrets_manager
+                    .get_secret_string(secret_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("Secrets Manager secret must contain SecretString"))?;
+                match json_key {
+                    None => secret,
+                    Some(key) => serde_json::from_str::<serde_json::Value>(&secret)
+                        .context("Secrets Manager SecretString is not valid JSON")?
+                        .as_object()
+                        .and_then(|object| object.get(key))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Secrets Manager jsonKey must identify a top-level string field"
+                            )
+                        })?,
+                }
+            }
+            SecretSource::Env { .. } | SecretSource::File { .. } => {
+                return Err(anyhow!(
+                    "local secret sources are not supported by the SSM provider"
+                ))
+            }
+        };
+        Ok(SecretString::new(value))
     }
-    Ok(url)
-}
-
-fn parse_optional_url(field: &str, value: Option<String>) -> anyhow::Result<Option<Url>> {
-    value.map(|value| parse_url(field, &value)).transpose()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{collections::HashMap, sync::Mutex};
 
-    struct MockClient(Mutex<VecDeque<ParameterPage>>);
+    #[derive(Default)]
+    struct MockSsm {
+        resources: Vec<Parameter>,
+        secrets: HashMap<String, Parameter>,
+        calls: Mutex<Vec<String>>,
+    }
 
     #[async_trait]
-    impl SsmClient for MockClient {
+    impl SsmClient for MockSsm {
         async fn get_parameters_by_path(
             &self,
-            _: &str,
+            path: &str,
             _: Option<String>,
         ) -> anyhow::Result<ParameterPage> {
-            self.0
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| anyhow!("unexpected call"))
+            Ok(ParameterPage {
+                parameters: self
+                    .resources
+                    .iter()
+                    .filter(|parameter| parameter.name.starts_with(path))
+                    .cloned()
+                    .collect(),
+                next_token: None,
+            })
+        }
+
+        async fn get_parameter(&self, name: &str) -> anyhow::Result<Option<Parameter>> {
+            self.calls.lock().unwrap().push(name.to_owned());
+            Ok(self.secrets.get(name).cloned())
         }
     }
 
-    fn document() -> String {
-        r#"
-issuer_url: https://issuer.example
-authorization_endpoint: https://issuer.example/auth
-token_endpoint: https://issuer.example/token
-client_id: upstream
-client_secret: secret
-scopes: [openid]
-allowed_scopes: [openid, email]
-allowed_redirect_origins: [https://app.example]
-default_redirect_uri: https://app.example/callback
-client_auth:
-  mode: public
+    #[derive(Default)]
+    struct MockSecretsManager {
+        secrets: HashMap<String, Option<String>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SecretsManagerClient for MockSecretsManager {
+        async fn get_secret_string(&self, secret_id: &str) -> anyhow::Result<Option<String>> {
+            self.calls.lock().unwrap().push(secret_id.to_owned());
+            Ok(self.secrets.get(secret_id).cloned().flatten())
+        }
+    }
+
+    fn upstream(secret: &str) -> String {
+        format!(
+            r#"apiVersion: oauthmux.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://issuer.example
+  oauthClient:
+    clientId: upstream
+    clientSecret:
+{secret}
+"#
+        )
+    }
+
+    fn relay() -> String {
+        r#"apiVersion: oauthmux.dev/v1alpha1
+kind: Relay
+metadata:
+  name: cognito-google
+spec:
+  upstreamRef:
+    name: google
+  clientAuthentication:
+    type: UpstreamClient
 "#
         .into()
     }
 
-    #[tokio::test]
-    async fn paginates_and_skips_only_malformed_instance() {
-        let client = Arc::new(MockClient(Mutex::new(VecDeque::from([
-            ParameterPage {
-                parameters: vec![Parameter {
-                    name: "/oauthmux/instances/good".into(),
-                    value: document(),
-                }],
-                next_token: Some("next".into()),
-            },
-            ParameterPage {
-                parameters: vec![
-                    Parameter {
-                        name: "/oauthmux/instances/bad".into(),
-                        value: "not: [yaml".into(),
-                    },
-                    Parameter {
-                        name: "/oauthmux/instances/good-two".into(),
-                        value: document(),
-                    },
-                ],
-                next_token: None,
-            },
-        ]))));
-        let provider =
-            SsmProvider::new(client, "/oauthmux/instances/", Duration::from_secs(60)).unwrap();
+    fn resource(name: &str, value: String) -> Parameter {
+        Parameter {
+            name: name.into(),
+            value,
+            parameter_type: ParameterType::String,
+        }
+    }
+
+    async fn load(
+        secret: &str,
+        ssm_secrets: HashMap<String, Parameter>,
+        manager_secrets: HashMap<String, Option<String>>,
+    ) -> (ProviderSnapshot, Arc<MockSsm>, Arc<MockSecretsManager>) {
+        let ssm = Arc::new(MockSsm {
+            resources: vec![
+                resource("/oauthmux/upstreams/google", upstream(secret)),
+                resource("/oauthmux/relays/cognito-google", relay()),
+            ],
+            secrets: ssm_secrets,
+            calls: Mutex::new(vec![]),
+        });
+        let manager = Arc::new(MockSecretsManager {
+            secrets: manager_secrets,
+            calls: Mutex::new(vec![]),
+        });
+        let provider = SsmProvider::new(
+            ssm.clone(),
+            manager.clone(),
+            DEFAULT_PREFIX,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         let snapshot = provider.load().await.unwrap();
-        assert_eq!(snapshot.instances.len(), 2);
-        assert!(snapshot.instances.values().all(|instance| instance
-            .upstream
-            .allowed_scopes
-            .as_ref()
-            .is_some_and(|scopes| scopes.iter().any(|scope| scope == "email"))));
+        (snapshot, ssm, manager)
+    }
+
+    #[tokio::test]
+    async fn resolves_secure_ssm_parameter() {
+        let secret_name = "/oauthmux/secrets/google";
+        let (snapshot, ssm, manager) = load(
+            "      valueFrom:\n        ssmParameter:\n          name: /oauthmux/secrets/google",
+            HashMap::from([(
+                secret_name.into(),
+                Parameter {
+                    name: secret_name.into(),
+                    value: "from-ssm".into(),
+                    parameter_type: ParameterType::SecureString,
+                },
+            )]),
+            HashMap::new(),
+        )
+        .await;
+        assert_eq!(
+            snapshot
+                .upstreams
+                .values()
+                .next()
+                .unwrap()
+                .client_secret
+                .expose(),
+            "from-ssm"
+        );
+        assert_eq!(ssm.calls.lock().unwrap().as_slice(), [secret_name]);
+        assert!(manager.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolves_whole_secrets_manager_secret_string() {
+        let (snapshot, _, manager) = load(
+            "      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google",
+            HashMap::new(),
+            HashMap::from([("oauthmux/google".into(), Some("whole-secret".into()))]),
+        )
+        .await;
+        assert_eq!(
+            snapshot
+                .upstreams
+                .values()
+                .next()
+                .unwrap()
+                .client_secret
+                .expose(),
+            "whole-secret"
+        );
+        assert_eq!(
+            manager.calls.lock().unwrap().as_slice(),
+            ["oauthmux/google"]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_secrets_manager_json_key() {
+        let (snapshot, _, _) = load(
+            "      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
+            HashMap::new(),
+            HashMap::from([(
+                "oauthmux/google".into(),
+                Some(r#"{"clientId":"id","clientSecret":"selected"}"#.into()),
+            )]),
+        )
+        .await;
+        assert_eq!(
+            snapshot
+                .upstreams
+                .values()
+                .next()
+                .unwrap()
+                .client_secret
+                .expose(),
+            "selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_key_requires_top_level_string() {
+        for secret in ["not-json", r#"{"clientSecret":42}"#, r#"{"other":"x"}"#] {
+            let ssm = Arc::new(MockSsm {
+                resources: vec![
+                    resource(
+                        "/oauthmux/upstreams/google",
+                        upstream("      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret"),
+                    ),
+                    resource("/oauthmux/relays/cognito-google", relay()),
+                ],
+                ..Default::default()
+            });
+            let manager = Arc::new(MockSecretsManager {
+                secrets: HashMap::from([("oauthmux/google".into(), Some(secret.into()))]),
+                ..Default::default()
+            });
+            let provider =
+                SsmProvider::new(ssm, manager, DEFAULT_PREFIX, Duration::from_secs(1)).unwrap();
+            let error = provider.load().await.unwrap_err().to_string();
+            assert!(error.contains("Upstream/google"));
+            assert!(!error.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn validates_resource_path_document_and_parameter_type() {
+        let manager = Arc::new(MockSecretsManager::default());
+        for parameter in [
+            resource(
+                "/oauthmux/upstreams/team/google",
+                upstream("      value: hidden"),
+            ),
+            resource("/oauthmux/upstreams/wrong", upstream("      value: hidden")),
+            Parameter {
+                name: "/oauthmux/upstreams/google".into(),
+                value: upstream("      value: hidden"),
+                parameter_type: ParameterType::SecureString,
+            },
+        ] {
+            let ssm = Arc::new(MockSsm {
+                resources: vec![parameter],
+                ..Default::default()
+            });
+            let provider =
+                SsmProvider::new(ssm, manager.clone(), DEFAULT_PREFIX, Duration::from_secs(1))
+                    .unwrap();
+            assert!(provider.load().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_inline_and_local_secret_sources() {
+        for secret in [
+            "      value: inline",
+            "      valueFrom:\n        env:\n          name: GOOGLE_SECRET",
+            "      valueFrom:\n        file:\n          path: /run/secrets/google",
+        ] {
+            let ssm = Arc::new(MockSsm {
+                resources: vec![
+                    resource("/oauthmux/upstreams/google", upstream(secret)),
+                    resource("/oauthmux/relays/cognito-google", relay()),
+                ],
+                ..Default::default()
+            });
+            let provider = SsmProvider::new(
+                ssm,
+                Arc::new(MockSecretsManager::default()),
+                DEFAULT_PREFIX,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+            assert!(provider.load().await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_secure_referenced_ssm_parameter_and_binary_secret() {
+        let secret_name = "/oauthmux/secrets/google";
+        let ssm = Arc::new(MockSsm {
+            resources: vec![
+                resource(
+                    "/oauthmux/upstreams/google",
+                    upstream(
+                        "      valueFrom:\n        ssmParameter:\n          name: /oauthmux/secrets/google",
+                    ),
+                ),
+                resource("/oauthmux/relays/cognito-google", relay()),
+            ],
+            secrets: HashMap::from([(
+                secret_name.into(),
+                Parameter {
+                    name: secret_name.into(),
+                    value: "not-encrypted".into(),
+                    parameter_type: ParameterType::String,
+                },
+            )]),
+            ..Default::default()
+        });
+        let provider = SsmProvider::new(
+            ssm,
+            Arc::new(MockSecretsManager::default()),
+            DEFAULT_PREFIX,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(provider.load().await.is_err());
+
+        let ssm = Arc::new(MockSsm {
+            resources: vec![
+                resource(
+                    "/oauthmux/upstreams/google",
+                    upstream(
+                        "      valueFrom:\n        secretsManager:\n          secretId: oauthmux/google",
+                    ),
+                ),
+                resource("/oauthmux/relays/cognito-google", relay()),
+            ],
+            ..Default::default()
+        });
+        let manager = Arc::new(MockSecretsManager {
+            secrets: HashMap::from([("oauthmux/google".into(), None)]),
+            ..Default::default()
+        });
+        let provider =
+            SsmProvider::new(ssm, manager, DEFAULT_PREFIX, Duration::from_secs(1)).unwrap();
+        assert!(provider.load().await.is_err());
     }
 
     #[test]
-    fn rejects_file_secret_and_invalid_prefix() {
-        let with_file = document().replace(
-            "client_secret: secret",
-            "client_secret: secret\nclient_secret_file: /secret",
-        );
-        assert!(parse_instance("bad", &with_file)
-            .unwrap_err()
-            .to_string()
-            .contains("client_secret_file"));
-        let client = Arc::new(MockClient(Mutex::new(VecDeque::new())));
-        assert!(SsmProvider::new(client, "missing-slashes", Duration::from_secs(1)).is_err());
-        let client = Arc::new(MockClient(Mutex::new(VecDeque::new())));
-        assert!(SsmProvider::new(client, DEFAULT_PREFIX, Duration::ZERO).is_err());
+    fn rejects_invalid_provider_prefix_and_interval() {
+        let ssm = Arc::new(MockSsm::default());
+        let manager = Arc::new(MockSecretsManager::default());
+        assert!(SsmProvider::new(
+            ssm.clone(),
+            manager.clone(),
+            "missing-slashes",
+            Duration::from_secs(1)
+        )
+        .is_err());
+        assert!(SsmProvider::new(ssm, manager, DEFAULT_PREFIX, Duration::ZERO).is_err());
     }
 }

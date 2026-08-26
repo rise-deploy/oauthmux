@@ -4,9 +4,9 @@ use url::Url;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct InstanceKey(String);
+pub struct ResourceKey(String);
 
-impl InstanceKey {
+impl ResourceKey {
     pub fn new(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
         if value.is_empty()
@@ -29,13 +29,13 @@ impl InstanceKey {
     }
 }
 
-impl fmt::Display for InstanceKey {
+impl fmt::Display for ResourceKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl FromStr for InstanceKey {
+impl FromStr for ResourceKey {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s)
@@ -97,29 +97,31 @@ impl fmt::Debug for SecretString {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct Instance {
-    pub key: InstanceKey,
-    pub upstream: UpstreamSpec,
-    pub client_auth: ClientAuth,
-    pub allowed_redirect_origins: Vec<Origin>,
-    pub default_redirect_uri: Option<Url>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct UpstreamSpec {
+pub struct Upstream {
+    pub key: ResourceKey,
     pub issuer_url: Url,
     pub authorization_endpoint: Option<Url>,
     pub token_endpoint: Option<Url>,
     pub jwks_uri: Option<Url>,
     pub client_id: String,
     pub client_secret: SecretString,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct Relay {
+    pub key: ResourceKey,
+    pub upstream: ResourceKey,
+    pub client_auth: ClientAuth,
     pub scopes: Vec<String>,
     pub allowed_scopes: Option<Vec<String>>,
+    pub allowed_redirect_origins: Vec<Origin>,
+    pub default_redirect_uri: Option<Url>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum ClientAuth {
+    UpstreamClient,
     Public,
     ClientSecret {
         client_id: String,
@@ -138,7 +140,36 @@ pub enum ClientJwks {
     Inline(serde_json::Value),
 }
 
-impl Instance {
+impl Upstream {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, url) in std::iter::once(("issuer_url", &self.issuer_url))
+            .chain(
+                self.authorization_endpoint
+                    .as_ref()
+                    .map(|url| ("authorization_endpoint", url)),
+            )
+            .chain(
+                self.token_endpoint
+                    .as_ref()
+                    .map(|url| ("token_endpoint", url)),
+            )
+            .chain(self.jwks_uri.as_ref().map(|url| ("jwks_uri", url)))
+        {
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(format!("{field} must be an absolute http(s) URL"));
+            }
+        }
+        if self.client_id.is_empty() {
+            return Err("client_id must not be empty".into());
+        }
+        if self.client_secret.expose().is_empty() {
+            return Err("client_secret must not be empty".into());
+        }
+        Ok(())
+    }
+}
+
+impl Relay {
     pub fn redirect_allowed(&self, redirect: &Url) -> bool {
         if !matches!(redirect.scheme(), "http" | "https")
             || redirect.host_str().is_none()
@@ -158,59 +189,27 @@ impl Instance {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        for (field, url) in std::iter::once(("upstream.issuer_url", &self.upstream.issuer_url))
-            .chain(
-                self.upstream
-                    .authorization_endpoint
-                    .as_ref()
-                    .map(|url| ("upstream.authorization_endpoint", url)),
-            )
-            .chain(
-                self.upstream
-                    .token_endpoint
-                    .as_ref()
-                    .map(|url| ("upstream.token_endpoint", url)),
-            )
-            .chain(
-                self.upstream
-                    .jwks_uri
-                    .as_ref()
-                    .map(|url| ("upstream.jwks_uri", url)),
-            )
-        {
-            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-                return Err(format!("{field} must be an absolute http(s) URL"));
-            }
-        }
-        if self.upstream.client_id.is_empty() {
-            return Err("upstream.client_id must not be empty".into());
-        }
-        if self.upstream.client_secret.expose().is_empty() {
-            return Err("upstream.client_secret must not be empty".into());
-        }
         let mut configured_scopes = HashSet::new();
-        for scope in &self.upstream.scopes {
+        for scope in &self.scopes {
             if !valid_scope_token(scope) {
-                return Err("upstream.scopes must contain valid RFC 6749 scope tokens".into());
+                return Err("scopes.default must contain valid RFC 6749 scope tokens".into());
             }
             if !configured_scopes.insert(scope.as_str()) {
-                return Err("upstream.scopes must not contain duplicates".into());
+                return Err("scopes.default must not contain duplicates".into());
             }
         }
-        if let Some(allowed) = &self.upstream.allowed_scopes {
+        if let Some(allowed) = &self.allowed_scopes {
             let mut allowed_scopes = HashSet::new();
             for scope in allowed {
                 if !valid_scope_token(scope) {
-                    return Err(
-                        "upstream.allowed_scopes must contain valid RFC 6749 scope tokens".into(),
-                    );
+                    return Err("scopes.allowed must contain valid RFC 6749 scope tokens".into());
                 }
                 if !allowed_scopes.insert(scope.as_str()) {
-                    return Err("upstream.allowed_scopes must not contain duplicates".into());
+                    return Err("scopes.allowed must not contain duplicates".into());
                 }
             }
             if !configured_scopes.is_subset(&allowed_scopes) {
-                return Err("upstream.scopes must be contained in upstream.allowed_scopes".into());
+                return Err("scopes.default must be contained in scopes.allowed".into());
             }
         }
         if let Some(default) = &self.default_redirect_uri {
@@ -219,20 +218,21 @@ impl Instance {
             }
         }
         match &self.client_auth {
+            ClientAuth::UpstreamClient | ClientAuth::Public => Ok(()),
             ClientAuth::ClientSecret {
                 client_id,
                 client_secret,
             } if client_id.is_empty() || client_secret.expose().is_empty() => {
-                Err("client_auth credentials must not be empty".into())
+                Err("clientAuthentication credentials must not be empty".into())
             }
             ClientAuth::PrivateKeyJwt { client_id, .. } if client_id.is_empty() => {
-                Err("client_auth.client_id must not be empty".into())
+                Err("clientAuthentication.clientId must not be empty".into())
             }
             ClientAuth::PrivateKeyJwt {
                 jwks: ClientJwks::Url(url),
                 ..
             } if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() => {
-                Err("client_auth.jwks must be an absolute http(s) URL".into())
+                Err("clientAuthentication.jwks must be an absolute http(s) URL".into())
             }
             ClientAuth::PrivateKeyJwt {
                 jwks: ClientJwks::Inline(value),
@@ -242,7 +242,7 @@ impl Instance {
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|keys| !keys.is_empty()) =>
             {
-                Err("client_auth.jwks must contain a non-empty keys array".into())
+                Err("clientAuthentication.jwks must contain a non-empty keys array".into())
             }
             _ => Ok(()),
         }
@@ -265,7 +265,8 @@ pub(crate) fn same_origin(a: &Url, b: &Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
-pub type InstanceMap = std::collections::HashMap<InstanceKey, Arc<Instance>>;
+pub type UpstreamMap = std::collections::HashMap<ResourceKey, Arc<Upstream>>;
+pub type RelayMap = std::collections::HashMap<ResourceKey, Arc<Relay>>;
 
 #[cfg(test)]
 mod tests {
@@ -274,24 +275,17 @@ mod tests {
     #[test]
     fn redirects_require_exact_origin_or_http_loopback() {
         let origin = Origin::parse("https://app.example.com").unwrap();
-        let mut instance = Instance {
-            key: InstanceKey::new("google").unwrap(),
-            upstream: UpstreamSpec {
-                issuer_url: Url::parse("https://issuer.example").unwrap(),
-                authorization_endpoint: None,
-                token_endpoint: None,
-                jwks_uri: None,
-                client_id: "id".into(),
-                client_secret: SecretString::new("secret"),
-                scopes: vec![],
-                allowed_scopes: None,
-            },
+        let mut relay = Relay {
+            key: ResourceKey::new("google").unwrap(),
+            upstream: ResourceKey::new("google").unwrap(),
             client_auth: ClientAuth::Public,
+            scopes: vec![],
+            allowed_scopes: None,
             allowed_redirect_origins: vec![origin],
             default_redirect_uri: None,
         };
-        assert!(instance.redirect_allowed(&Url::parse("https://app.example.com/cb").unwrap()));
-        assert!(instance.redirect_allowed(&Url::parse("http://localhost:5173/cb").unwrap()));
+        assert!(relay.redirect_allowed(&Url::parse("https://app.example.com/cb").unwrap()));
+        assert!(relay.redirect_allowed(&Url::parse("http://localhost:5173/cb").unwrap()));
         for bad in [
             "https://app.example.com.evil.test/cb",
             "https://app.example.com@evil.test/cb",
@@ -301,12 +295,9 @@ mod tests {
             "https://user@app.example.com/cb",
             "https://app.example.com/cb#fragment",
         ] {
-            assert!(
-                !instance.redirect_allowed(&Url::parse(bad).unwrap()),
-                "{bad}"
-            );
+            assert!(!relay.redirect_allowed(&Url::parse(bad).unwrap()), "{bad}");
         }
-        instance.default_redirect_uri = Some(Url::parse("https://evil.test/cb").unwrap());
-        assert!(instance.validate().is_err());
+        relay.default_redirect_uri = Some(Url::parse("https://evil.test/cb").unwrap());
+        assert!(relay.validate().is_err());
     }
 }

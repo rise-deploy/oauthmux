@@ -101,14 +101,14 @@ mod tests {
         let old = [1_u8; 32];
         let new = [2_u8; 32];
         let old_sealer = XChaChaSealer::new(&old, None).unwrap();
-        let token = old_sealer.seal(b"secret", b"instance").unwrap();
+        let token = old_sealer.seal(b"secret", b"resource").unwrap();
         let rotated = XChaChaSealer::new(&new, Some(&old)).unwrap();
-        assert_eq!(rotated.unseal(&token, b"instance").unwrap(), b"secret");
+        assert_eq!(rotated.unseal(&token, b"resource").unwrap(), b"secret");
         assert!(rotated.unseal(&token, b"other").is_err());
         let mut tampered = token.into_bytes();
         *tampered.last_mut().unwrap() ^= 1;
         assert!(rotated
-            .unseal(&String::from_utf8(tampered).unwrap(), b"instance")
+            .unseal(&String::from_utf8(tampered).unwrap(), b"resource")
             .is_err());
     }
 

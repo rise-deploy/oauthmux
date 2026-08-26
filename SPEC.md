@@ -1,370 +1,258 @@
-# oauthmux — OAuth/OIDC Multiplexing Proxy
+# oauthmux specification
 
-**Spec for initial implementation in this (empty) repository.**
-Working names: repository/library crate `rise-oauth-multiplexer`, binary `oauthmux`. Names may be
-finalized later; keep them confined to `Cargo.toml` metadata, the bin name, and the env-var prefix
-so a rename is mechanical.
+## Mission
 
-## 1. Mission
+oauthmux is a reusable OAuth/OIDC transparent relay in Rust. A named upstream owns one external
+OAuth client registration and one stable callback. One or more named relays reference that
+upstream and multiplex authorization results to an explicit set of relying-party origins.
 
-Build a reusable OAuth/OIDC multiplexing proxy in Rust. It gives an upstream OAuth provider
-(Google, GitHub, Snowflake, Dex, any OIDC or plain-OAuth2 provider) **one stable callback URL**
-per configured *instance*, and multiplexes that across many application redirect targets
-(production, previews, localhost). It implements: authorization-code flow with PKCE, code
-exchange, refresh-token proxying, OIDC discovery and JWKS proxying.
+The protocol engine is an embeddable Axum router. The standalone binary supplies File and AWS SSM
+configuration providers and runs as a native server or AWS Lambda container.
 
-The design is **Traefik-shaped**: a core engine serves the flows; pluggable **config providers**
-discover instance configuration from different sources (a YAML file, AWS SSM parameters, later
-Kubernetes objects or a Rise control plane).
+Transparent relay preserves the upstream token response, issuer, signature, JWKS, audience, and
+UserInfo contract. A relying party sends authorization and token requests through oauthmux while
+continuing to trust the upstream issuer.
 
-Two consumption modes, both first-class:
+## Workspace
 
-1. **Library** — a host application (concretely: the Rise backend,
-   `github.com/rise-deploy/rise`) mounts the Axum routes and supplies its own dynamic
-   instance-resolution trait impl. The crate API must make this replacement possible without the
-   host importing anything but the core crate.
-2. **Standalone binary** — a minimal single-binary server, shipped as a Docker image, that runs
-   the same engine with config providers. A Lambda execution mode comes later; do not preclude it
-   (see §10).
-
-### Reference implementation
-
-This project extracts and generalizes an existing, working implementation inside the Rise
-codebase (`github.com/rise-deploy/rise`, branch `develop`). If that repo is accessible, **read it
-first and port code from it** rather than re-deriving the protocol logic:
-
-| Rise path | What to take |
-| --- | --- |
-| `src/server/extensions/providers/oauth/handlers.rs` | The five endpoint handlers: authorize, callback, token (incl. CORS/OPTIONS), OIDC discovery, JWKS. Port the flow logic; replace project/extension DB lookups with the `InstanceResolver` seam and the project-derived redirect check with the instance's explicit origin allow-list. |
-| `src/server/extensions/providers/oauth/provider.rs` | OIDC endpoint discovery from `issuer_url` (`.well-known/openid-configuration`), upstream code exchange, refresh proxying, Rise-client-credential handling. |
-| `src/server/extensions/providers/oauth/models.rs` | Type shapes: instance spec, transient flow state, `TokenRequest`/`OAuth2TokenResponse`/`OAuth2ErrorResponse` (RFC 6749 shapes), callback params. |
-| `src/server/extensions/providers/oauth/routes.rs` | Route table (`/oidc/{project}/{extension}/…`) — the two-segment key shape the embedded host will keep using. |
-| `docs/user/src/content/docs/user-guide/oauth.md` | The authoritative description of externally observable behavior. Treat this as the protocol contract. |
-
-**Semantics to preserve exactly** (they are documented user-facing behavior in Rise):
-
-- Authorization codes are single-use*, expire after **5 minutes**. State tokens expire after
-  **10 minutes**. (*See §5 for the stateless relaxation.)
-- PKCE method `S256` only.
-- Loopback (`http://localhost:*`, `http://127.0.0.1:*`) redirect URIs are always allowed, for
-  local development.
-- Secret comparisons are constant-time (use the `subtle` crate).
-- The token endpoint is RFC 6749-compliant: form-encoded request, JSON response, proper
-  `error`/`error_description` bodies, CORS support (`POST` + preflight `OPTIONS`).
-- Relay metadata preserves the upstream issuer and JWKS URL while routing authorization and token
-  endpoints through the proxy. JWKS is also available through the proxy endpoint.
-- The upstream token response is passed through faithfully on exchange (preserve body,
-  content-type, and status from upstream rather than re-encoding lossily).
-
-If the Rise repo is not accessible, implement from this spec plus the RFCs (6749, 7636, 7523);
-the spec is self-sufficient.
-
-## 2. Repository layout
-
-Cargo workspace:
-
-```
+```text
 crates/
-  oauthmux-core/          # engine: domain model, seams, Axum router, sealing, flows
-  oauthmux-provider-file/ # YAML file config provider
-  oauthmux-provider-ssm/  # AWS SSM Parameter Store config provider
-  oauthmux/               # the binary: config loading, provider wiring, server runtime
-Dockerfile
-.github/workflows/ci.yml
-README.md
-SPEC.md                   # this file
+  oauthmux-core/          protocol engine, resources, resolver seams, router, sealing
+  oauthmux-provider-file/ multi-document YAML provider and local secret sources
+  oauthmux-provider-ssm/  SSM resource provider and AWS secret sources
+  oauthmux/               provider wiring, native server, Lambda runtime, schema CLI
 ```
 
-Rules:
+Provider crates depend on `oauthmux-core`; the core has no provider-specific dependency.
 
-- `oauthmux-core` has **no** AWS, Kubernetes, or file-watching dependencies, and no `tokio`
-  features beyond what Axum needs. It is the crate the Rise backend will depend on.
-- Providers depend on core, never the reverse.
-- The binary crate is thin: parse config, construct providers, run the server.
-- Rust stable, edition 2021+. `cargo fmt` and `cargo clippy --workspace --all-targets
-  -- -D warnings` must pass in CI. Suggested key dependencies: `axum`, `tokio`, `reqwest`
-  (rustls), `serde`/`serde_yaml`, `chacha20poly1305` (or `aes-gcm`), `jsonwebtoken`, `subtle`,
-  `arc-swap`, `tracing`, `aws-sdk-ssm` (provider crate only).
+## Resource model
 
-## 3. Core domain model (`oauthmux-core`)
+Configuration uses `oauthmux.dev/v1alpha1` resources. `ResourceKey` is a URL-safe opaque name.
 
 ```rust
-/// Opaque instance address. The standalone binary uses one path segment
-/// ("google"); an embedding host may map several segments onto it
-/// ("my-app/oauth-google").
-pub struct InstanceKey(String);
-
-pub struct Instance {
-    pub key: InstanceKey,
-    pub upstream: UpstreamSpec,
-    pub client_auth: ClientAuth,
-    /// Exact origins (scheme + host + port) allowed as post-flow redirect
-    /// targets, e.g. "https://app.example.com". Loopback origins are always
-    /// implicitly allowed. No wildcards.
-    pub allowed_redirect_origins: Vec<Origin>,
-    /// Default redirect target when the authorize request names none.
-    pub default_redirect_uri: Option<Url>,
-}
-
-pub struct UpstreamSpec {
+pub struct Upstream {
+    pub key: ResourceKey,
     pub issuer_url: Url,
-    /// Optional overrides for non-OIDC providers (GitHub etc.). When absent,
-    /// resolved from {issuer_url}/.well-known/openid-configuration and cached
-    /// with a TTL (~1h) per instance.
     pub authorization_endpoint: Option<Url>,
     pub token_endpoint: Option<Url>,
     pub jwks_uri: Option<Url>,
     pub client_id: String,
-    pub client_secret: SecretString,   // resolved by the provider (§6)
+    pub client_secret: SecretString,
+}
+
+pub struct Relay {
+    pub key: ResourceKey,
+    pub upstream: ResourceKey,
+    pub client_auth: ClientAuth,
     pub scopes: Vec<String>,
-    /// Optional restriction for requested and configured default scopes.
     pub allowed_scopes: Option<Vec<String>>,
-}
-
-/// How the *application* authenticates to this proxy's /token endpoint.
-pub enum ClientAuth {
-    /// Public client: PKCE required, no client credential.
-    Public,
-    /// Confidential client with a shared secret (constant-time compare).
-    ClientSecret { client_id: String, client_secret: SecretString },
-    /// Confidential client presenting an RFC 7523 JWT assertion
-    /// (`client_assertion_type=…:jwt-bearer`), verified against a public key.
-    /// No client credential at rest. (Milestone M2.)
-    PrivateKeyJwt { client_id: String, jwks: ClientJwks }, // inline JWKS or URL
+    pub allowed_redirect_origins: Vec<Origin>,
+    pub default_redirect_uri: Option<Url>,
 }
 ```
 
-### Trait seams
+`Upstream` owns the external authorization-server connection, OAuth client credentials, and
+provider callback. `Relay` owns transparent-relay scope policy, downstream authentication, and
+redirect policy.
 
-```rust
-/// What the router consumes. Every request resolves the instance fresh —
-/// no snapshot assumption — so a DB-backed host (Rise) can implement this
-/// directly.
-#[async_trait]
-pub trait InstanceResolver: Send + Sync + 'static {
-    async fn resolve(&self, key: &InstanceKey) -> Result<Option<Arc<Instance>>, ResolveError>;
-}
+`ClientAuth` supports:
 
-/// Traefik-style config source. Emits full snapshots; the runtime merges
-/// snapshots from all providers into a `Registry` (an `arc_swap` map) which
-/// itself implements `InstanceResolver`. Push (watch) and poll providers both
-/// fit: a poll provider re-emits on its interval.
-#[async_trait]
-pub trait ConfigProvider: Send + Sync + 'static {
-    fn name(&self) -> &str;
-    /// Produce one complete snapshot for startup or invocation-driven refresh.
-    async fn load(&self) -> anyhow::Result<ProviderSnapshot>;
-    /// Long-running task: send a full snapshot of this provider's instances
-    /// whenever they (may) have changed. First send completes startup readiness.
-    async fn run(self: Arc<Self>, tx: watch::Sender<ProviderSnapshot>) -> anyhow::Result<()>;
-}
+- `UpstreamClient`: the downstream request presents the referenced upstream's client ID and
+  secret.
+- `Public`: no client credential; S256 PKCE is mandatory.
+- `ClientSecret`: a relay-specific client ID and secret are compared in constant time.
+- `PrivateKeyJwt`: an RFC 7523 assertion is verified against inline JWKS or a JWKS URL.
 
-/// AEAD sealing for transient state (§5). Keyed, versioned, rotation-aware:
-/// seal with the current key, unseal with current-then-previous.
-pub trait Sealer: Send + Sync + 'static { /* seal(&[u8]) -> String; unseal(&str) -> Result<Vec<u8>> */ }
+`ResourceResolver` resolves relays and upstreams independently for every request. `Registry`
+implements the resolver with an atomically swapped `ProviderSnapshot` containing both maps.
+Provider collisions are keyed by `(kind, name)`; the earlier-configured provider remains active.
 
-/// Optional replay cache restoring strict single-use codes (§5).
-#[async_trait]
-pub trait ReplayCache: Send + Sync + 'static {
-    /// Returns true the first time a given envelope id is seen, false after.
-    async fn first_use(&self, id: &str, ttl: Duration) -> Result<bool, CacheError>;
-}
-```
+Every provider snapshot is a complete valid resource graph. A relay reference to an absent
+upstream rejects the candidate snapshot.
 
-Merge rule for multiple providers: instance keys are namespaced per provider run only if they
-collide; on collision, **log an error and keep the instance from the earlier-configured
-provider** (deterministic order = configuration order). Never silently pick one.
+## HTTP routes
 
-### Router / embedding API
-
-```rust
-pub struct MuxConfig {
-    pub public_url: Url,              // external base URL of this proxy
-    pub sealer: Arc<dyn Sealer>,
-    pub replay_cache: Option<Arc<dyn ReplayCache>>,
-    pub http: reqwest::Client,        // injected so hosts control TLS/proxy settings
-}
-
-/// One wildcard route set; the KeyStrategy maps matched path segments to an
-/// InstanceKey. `SingleSegment` serves the standalone binary
-/// (`/oidc/{instance}/…`); `TwoSegment` serves the Rise embedding
-/// (`/oidc/{project}/{extension}/…`, key = "{project}/{extension}");
-/// `Custom(fn)` covers anything else.
-pub enum KeyStrategy { SingleSegment, TwoSegment, Custom(Arc<dyn Fn(&[&str]) -> Option<InstanceKey> + Send + Sync>) }
-
-pub fn router(resolver: Arc<dyn InstanceResolver>, cfg: MuxConfig, keys: KeyStrategy)
-    -> axum::Router;   // nestable: host mounts it at any prefix
-```
-
-Acceptance for the embedding mode: a doc-tested example in `oauthmux-core` that mounts the router
-with `TwoSegment` and a `HashMap`-backed resolver — this is the exact shape Rise will use.
-
-## 4. HTTP endpoints
-
-All under the mounted prefix, per instance key `K` (shown single-segment):
+For relay key `R` and upstream key `U`:
 
 | Route | Behavior |
 | --- | --- |
-| `GET /oidc/{K}/authorize` | Validates the application redirect and downstream PKCE, seals application state, and generates independent upstream state and PKCE. oauthmux replaces `client_id`, `redirect_uri`, `state`, `code_challenge`, and `code_challenge_method`; constrains the flow to authorization code with query response mode; and forwards the remaining query pairs. A supplied `scope` is preserved subject to `allowed_scopes`; configured `scopes` is the fallback. OIDC request objects are rejected. |
-| `GET /oidc/{K}/callback` | Unseals and validates state (TTL 10 min, instance key match), exchanges the upstream code with the upstream credentials and PKCE verifier, and seals the raw token response into the application code. The application receives its original state and all non-owned upstream response parameters. |
-| `POST /oidc/{K}/token` | Form-encoded, RFC 6749. `authorization_code` authenticates the application, validates TTL/replay/redirect/PKCE, and returns the stored upstream response verbatim. `refresh_token` authenticates the application, preserves grant extensions, replaces downstream client authentication with upstream credentials, and relays the upstream response. CORS reflects allowed origins and supports preflight `OPTIONS`. |
-| `GET /oidc/{K}/.well-known/openid-configuration` | Fetch upstream discovery (if OIDC), preserve its `issuer` and `jwks_uri`, and rewrite `authorization_endpoint` and `token_endpoint` to `{public_url}/oidc/{K}/…`. For instances with explicit endpoints, synthesize the same relay metadata from configuration. This endpoint supports manual client configuration; its URL and upstream `issuer` do not form a standard OIDC Discovery contract. |
-| `GET /oidc/{K}/jwks` | Proxy upstream JWKS (cache ~10 min). 404 for instances with no JWKS. |
-| `GET /healthz` | Liveness (binary only, not part of the embeddable router). |
-| `GET /readyz` | Ready once every configured provider has delivered its first snapshot (binary only). |
+| `GET /oidc/{R}/authorize` | Validates redirect and downstream PKCE, applies relay scope policy, creates independent upstream state and PKCE, and redirects to the referenced upstream. |
+| `GET /oidc/upstreams/{U}/callback` | Unseals upstream-bound state, resolves the originating relay, exchanges the upstream code, and returns to the relay's validated application redirect. |
+| `POST /oidc/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged. |
+| `POST /oidc/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. |
+| `GET /oidc/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
+| `GET /oidc/{R}/jwks` | Proxies the referenced upstream JWKS. |
+| `GET /healthz` | Standalone runtime liveness. |
+| `GET /readyz` | Ready after every configured provider supplies its first snapshot. |
 
-Unknown instance keys → 404 with an RFC 6749-style error body on `/token`, plain 404 elsewhere.
-Never reflect unvalidated `redirect_uri` values into responses (open-redirect defense).
+Several relays referencing one upstream use the same provider callback. The flow-state envelope is
+sealed with the upstream key as associated data and carries the originating relay key. The
+authorization-code envelope is sealed with the relay key.
 
-## 5. Transient state: sealed envelopes (stateless-ish)
+Unknown relay or upstream keys return 404. The token endpoint uses RFC 6749 error bodies. An
+unvalidated redirect URI is never reflected into a response.
 
-No database. Both transient records are AEAD envelopes (XChaCha20-Poly1305 or AES-256-GCM)
-sealed by the `Sealer`:
+## Protocol invariants
 
-- **Flow-state envelope** — carried through the upstream round-trip in the `state` parameter:
-  `{instance_key, app_redirect_uri, app_state, upstream_pkce_verifier, client_code_challenge?,
-  client_code_challenge_method?, issued_at, nonce}`. TTL 10 minutes, enforced at unseal.
-- **Authorization-code envelope** — *is* the code handed to the application:
-  `{instance_key, envelope_id (random 128-bit), issued_at, redirect_uri, client_code_challenge?,
-  upstream_response: {status, content_type, body}}`. TTL 5 minutes.
+- Authorization code flow only; query response mode only.
+- S256 PKCE only.
+- Flow-state TTL is 10 minutes.
+- Authorization-code TTL is 5 minutes.
+- Redirect policy matches exact HTTP(S) origins. HTTP loopback on `localhost`, `127.0.0.1`, and
+  `::1` is allowed.
+- Client-secret comparisons are constant-time.
+- Upstream-owned authorization parameters are replaced rather than forwarded.
+- Other authorization and grant extensions are preserved.
+- OIDC request objects are rejected because their routing fields conflict with proxy ownership.
+- Upstream token response status, content type, and bytes are preserved.
+- Discovery and JWKS responses are cached for bounded TTLs.
 
-Envelope format: `v1.<base64url(nonce || ciphertext || tag)>`; the instance key is bound as AEAD
-associated data. Mind URL practicality: envelopes travel in query strings — keep serialization
-compact (serde + a compact binary format such as `postcard`), and document that very large
-upstream token responses can exceed URL limits (log a warning above ~4 KB sealed).
+The standalone binary supplies an in-memory replay cache. An embedding without a replay cache
+accepts a sealed authorization code for its five-minute cryptographic lifetime.
 
-**Single-use caveat (must be documented in the README):** without a `ReplayCache`, "single-use"
-degrades to "valid for 5 minutes". Ship an in-memory `ReplayCache` (per-replica, enabled by
-default in the binary) and leave Redis/etc. to future provider crates. The Rise embedding can
-back `ReplayCache` with its existing table if desired.
+## Configuration resources
 
-**Keys & rotation:** the binary takes `OAUTHMUX_SEAL_KEY` (base64, 32 bytes) plus optional
-`OAUTHMUX_SEAL_KEY_PREVIOUS` for rotation. Refuse to start without a key; refuse a key of the
-wrong length. Never log key material or envelope plaintexts.
-
-## 6. Config providers
-
-### 6.1 File provider (`oauthmux-provider-file`) — Milestone M1
-
-Reads one YAML file, default `/etc/oauthmux/config.yaml` (path configurable). Schema:
+The File provider reads a YAML document stream:
 
 ```yaml
-instances:
-  google:
-    issuer_url: https://accounts.google.com
-    client_id: 1234.apps.googleusercontent.com
-    client_secret: ${GOOGLE_SECRET}          # env interpolation
-    # client_secret_file: /run/secrets/google  # or file indirection
-    scopes: [openid, email, profile]
-    allowed_redirect_origins: [https://app.example.com]
-    default_redirect_uri: https://app.example.com/
-    client_auth:
-      mode: public                            # public | client_secret | private_key_jwt
-  github:
-    issuer_url: https://github.com
-    authorization_endpoint: https://github.com/login/oauth/authorize
-    token_endpoint: https://github.com/login/oauth/access_token
-    client_id: Iv1.abc
-    client_secret_file: /run/secrets/github
-    scopes: [read:user, user:email]
-    allowed_redirect_origins: [https://app.example.com]
-    client_auth:
-      mode: client_secret
-      client_id: my-app
-      client_secret: ${MUX_GITHUB_CLIENT_SECRET}
+apiVersion: oauthmux.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  endpoints:
+    authorization: https://accounts.google.com/o/oauth2/v2/auth
+    token: https://oauth2.googleapis.com/token
+    jwks: https://www.googleapis.com/oauth2/v3/certs
+  oauthClient:
+    clientId: 1234.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_CLIENT_SECRET
+---
+apiVersion: oauthmux.dev/v1alpha1
+kind: Relay
+metadata:
+  name: cognito-google
+spec:
+  upstreamRef:
+    name: google
+  scopes:
+    default: [openid, email, profile]
+    allowed: [openid, email, profile]
+  clientAuthentication:
+    type: UpstreamClient
+  redirectPolicy:
+    allowedOrigins: [https://app.example.com]
 ```
 
-Rules: `client_secret` XOR `client_secret_file`, exactly one. `${VAR}` interpolation resolves
-from the process environment at load time; a missing variable is a hard error naming the variable
-(never the value). Hot-reload: poll mtime every 30 s (configurable); an invalid file logs an
-error and **keeps the last good snapshot**. Validation errors name the instance and field.
+Unknown fields, kinds, API versions, duplicate identities, invalid URLs, invalid origins, invalid
+scope tokens, and dangling references reject the candidate snapshot.
 
-### 6.2 SSM provider (`oauthmux-provider-ssm`) — Milestone M1/M2
+`oauthmux schema` prints a JSON Schema generated from the Rust configuration types.
 
-Discovers instances under a parameter prefix, default shape: one parameter per instance,
-`{prefix}{instance-key}` (e.g. `/oauthmux/instances/google`), value = the same YAML/JSON
-document as one file-provider instance entry (secrets inline — SSM `SecureString` is the secret
-store, so `client_secret` plaintext-in-parameter is the expected form; `client_secret_file` is
-rejected here).
+## Secret sources
 
-- Enumerate with `GetParametersByPath` (recursive, `WithDecryption=true`), handling pagination.
-- Poll on an interval (default 60 s, configurable). Diffing is unnecessary — emit the snapshot;
-  the registry swap is cheap.
-- Region/credentials from the default AWS provider chain. Required IAM (document in README):
-  `ssm:GetParametersByPath` on the prefix, `kms:Decrypt` on the key encrypting the parameters.
-- A malformed parameter fails **that instance** (logged with the parameter name), not the
-  snapshot.
-- Unit-test the parsing/merge logic against a mocked SSM trait; do not require live AWS in CI.
+A secret-bearing field contains exactly one `value` or `valueFrom` member.
 
-### 6.3 Future providers (do not implement; do not preclude)
+The File provider supports:
 
-Kubernetes (ConfigMap/CRD watch), Rise control plane (resource API), env-var-only single
-instance. The `ConfigProvider` trait is the only contract they need.
-
-## 7. Standalone binary (`oauthmux`)
-
-Env-first configuration (prefix `OAUTHMUX_`):
-
+```yaml
+clientSecret: { value: local-secret }
+clientSecret: { valueFrom: { env: { name: GOOGLE_CLIENT_SECRET } } }
+clientSecret: { valueFrom: { file: { path: ./secrets/google } } }
 ```
-OAUTHMUX_PUBLIC_URL=https://auth.example.com     # required
-OAUTHMUX_SEAL_KEY=base64:…                       # required, 32 bytes
-OAUTHMUX_SEAL_KEY_PREVIOUS=base64:…              # optional, rotation
-OAUTHMUX_LISTEN=0.0.0.0:8080                     # default
-OAUTHMUX_PROVIDER_FILE=/etc/oauthmux/config.yaml # enables file provider
+
+Relative file paths resolve from the resource file's directory. File, environment, and inline
+values are re-resolved on every provider refresh.
+
+The SSM provider supports:
+
+```yaml
+clientSecret:
+  valueFrom:
+    ssmParameter:
+      name: /oauthmux/secrets/google
+```
+
+The referenced parameter must exist, have an absolute name, and use the `SecureString` type.
+
+```yaml
+clientSecret:
+  valueFrom:
+    secretsManager:
+      secretId: oauthmux/google
+      jsonKey: clientSecret
+```
+
+Secrets Manager resolution uses `GetSecretValue` and the current `SecretString`. Without
+`jsonKey`, the complete string is used. With `jsonKey`, the value must be valid JSON whose named
+top-level field is a string. Binary secrets and nested JSON paths are rejected.
+
+Secret references are deduplicated within a candidate snapshot. Resolved secret values use a
+redacted debug representation and are never included in errors or logs.
+
+## File provider
+
+`OAUTHMUX_PROVIDER_FILE` names a multi-document YAML file. The provider reloads the resource file
+and referenced local secrets every `OAUTHMUX_PROVIDER_FILE_POLL`, default `30s`. A failed reload
+retains the complete last-good snapshot.
+
+## AWS SSM provider
+
+`OAUTHMUX_PROVIDER_SSM_PREFIX` is one absolute root ending in `/`. The provider enumerates the
+fixed resource paths independently:
+
+```text
+{root}upstreams/{name}
+{root}relays/{name}
+{root}brokers/{name}
+```
+
+Resource parameters use the SSM `String` type and contain the complete resource document. Path
+kind/name and document kind/name must agree. Names occupy exactly one path segment. `Broker` paths
+are reserved and reject a snapshot because brokered issuer execution is unavailable.
+
+The provider handles `GetParametersByPath` pagination and resolves referenced SSM parameters with
+`GetParameter`. Secrets Manager references use `GetSecretValue`. Region and credentials follow the
+AWS SDK default provider chain.
+
+A parse, reference, secret-resolution, or validation error rejects the complete candidate and
+retains the provider's last-good snapshot. SSM reads are not transactional; a temporarily
+inconsistent multi-parameter rollout becomes active after a later refresh observes a complete
+valid graph.
+
+## Runtime
+
+```text
+OAUTHMUX_PUBLIC_URL=https://auth.example.com
+OAUTHMUX_SEAL_KEY=base64:…
+OAUTHMUX_SEAL_KEY_PREVIOUS=base64:…
+OAUTHMUX_LISTEN=0.0.0.0:8080
+OAUTHMUX_PROVIDER_FILE=/etc/oauthmux/config.yaml
 OAUTHMUX_PROVIDER_FILE_POLL=30s
-OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/instances/ # enables SSM provider
+OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/
 OAUTHMUX_PROVIDER_SSM_POLL=60s
-OAUTHMUX_LAMBDA_CONFIG_TTL=60s                  # invocation-driven provider refresh
-OAUTHMUX_LOG=info                                # tracing filter
+OAUTHMUX_LAMBDA_CONFIG_TTL=60s
+OAUTHMUX_LOG=info
 ```
 
-At least one provider must be enabled or startup fails with a clear message. Routes:
-`/oidc/{instance}/…` (SingleSegment), `/healthz`, `/readyz`. Structured logs via
-`tracing-subscriber` (JSON when not a TTY). Graceful shutdown on SIGTERM/SIGINT. No config
-file for the binary itself — env only.
+At least one provider is required. Native mode reloads providers on their polling intervals.
+Lambda mode loads all first snapshots during cold start and refreshes stale provider snapshots
+synchronously before an invocation. Wall-clock age includes intervals while Lambda freezes the
+process. A failed provider refresh retains that provider's last-good snapshot.
 
-## 8. Docker image
+## Sealing and rotation
 
-Multi-stage build to a single static binary:
+Transient values are XChaCha20-Poly1305 envelopes serialized with postcard. The current 32-byte
+key seals new values. `OAUTHMUX_SEAL_KEY_PREVIOUS` remains accepted during rotation. Key material,
+secret material, and envelope plaintext are never logged.
 
-- Build stage: `rust:<pinned>` with `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl`.
-- Final stage: `scratch` (or `gcr.io/distroless/static` if scratch fights you) containing the
-  binary + CA certificates (`/etc/ssl/certs/ca-certificates.crt` — reqwest/rustls needs roots
-  for upstream calls). Non-root user. `EXPOSE 8080`, `ENTRYPOINT ["/oauthmux"]`.
-- CI builds `linux/amd64` and `linux/arm64` via buildx. Target image size: tens of MB.
+## Unsupported brokered issuer mode
 
-## 9. Testing & acceptance
-
-- **Unit:** envelope seal/unseal round-trip, TTL expiry, key rotation (previous-key unseal),
-  tamper rejection; redirect-origin validation incl. loopback and open-redirect attempts; PKCE
-  S256 verification; client-secret constant-time auth; provider YAML parsing incl. every
-  validation error path; snapshot merge + collision rule.
-- **Integration (in CI, no external services):** an in-process signed OIDC fixture exercises
-  public and confidential clients, request relay, scope policy, refresh, nonce and ID-token trust,
-  replay, redirect validation, discovery, and two-segment embedding. Google and Cognito behavior
-  is expressed as small profiles over the generic fixture.
-- **End to end:** a pinned Dex container and the standalone oauthmux process run the complete
-  authorization-code, ID-token validation, refresh, replay, and redirect-policy flow through
-  `mise run e2e`.
-- **CI:** fmt check, clippy `-D warnings`, in-process tests, Dex E2E, and Docker build.
-
-## 10. Milestones
-
-1. **M1 — core + file provider + binary.** Workspace, core engine (flows, sealing, router,
-   `Public` + `ClientSecret` auth), file provider with hot-reload, binary with env config,
-   mock-IdP integration suite, README with quickstart.
-2. **M2 — SSM provider + private_key_jwt.** SSM discovery per §6.2; `PrivateKeyJwt` client auth
-   (RFC 7523 assertion verification, inline JWKS and JWKS URL with caching).
-3. **M3 — image + release.** Dockerfile per §8, multi-arch CI publish, versioned release
-   workflow, operator docs (IAM policy snippet, key rotation runbook, replay-cache caveat).
-4. **M4 — Lambda mode.** The binary uses `lambda_http` over the same router. Provider snapshots
-   load during cold start and refresh synchronously at invocation boundaries after a configurable
-   TTL. Each provider retains its last valid snapshot when a refresh fails.
-
-## 11. Non-goals
-
-- No database, no user sessions, no UI, no token storage after exchange (applications own their
-  tokens).
-- No Rise types or Rise-specific behavior in any crate here; the Rise migration to this crate
-  happens in the Rise repository, later, against the §3 embedding API.
-- No wildcard redirect origins, no PKCE `plain`, no implicit grant.
+Brokered issuer mode requires oauthmux-owned issuer metadata, signing-key rotation, JWKS,
+downstream token and UserInfo issuance, claims policy, token lifetime policy, and a downstream
+client registry. Configuration under an SSM `brokers` path is rejected until those semantics are
+implemented.

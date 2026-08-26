@@ -67,6 +67,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features
+      - run: mise run schema:check
 
   e2e:
     if: github.event.action != 'labeled' || github.event.label.name == 'preview'

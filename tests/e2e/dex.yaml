@@ -22,7 +22,7 @@ staticClients:
     name: oauthmux E2E
     secret: oauthmux-e2e-secret
     redirectURIs:
-      - http://127.0.0.1:18080/oidc/dex/callback
+      - http://127.0.0.1:18080/oidc/upstreams/dex/callback
 
 connectors:
   - type: mockCallback

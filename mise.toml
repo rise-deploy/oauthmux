@@ -11,6 +11,7 @@ run = [
   "cargo fmt --all -- --check",
   "cargo clippy --workspace --all-targets --all-features -- -D warnings",
   "cargo test --workspace --all-features",
+  "mise run schema:check",
   "mise run docs",
 ]
 
@@ -18,6 +19,19 @@ run = [
 description = "Build the documentation site"
 dir = "docs"
 run = "npm ci && npm run build"
+
+[tasks.schema]
+description = "Generate the oauthmux configuration schema"
+run = "cargo run -q -p oauthmux -- schema > docs/public/oauthmux.schema.json"
+
+[tasks."schema:check"]
+description = "Check the generated oauthmux configuration schema"
+run = "cargo run -q -p oauthmux -- schema | diff -u docs/public/oauthmux.schema.json -"
+
+[tasks."docs:serve"]
+description = "Serve the documentation site locally"
+dir = "docs"
+run = "npm ci && npm run dev"
 
 [tasks.e2e]
 description = "Run Docker-backed end-to-end tests"

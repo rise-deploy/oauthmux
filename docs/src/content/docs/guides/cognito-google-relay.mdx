@@ -8,33 +8,24 @@ sidebar:
 import Mermaid from '../../../components/Mermaid.astro';
 
 This layout lets one Google OAuth client serve many Amazon Cognito user pools through one stable
-oauthmux callback. Each pool talks to the same oauthmux instance for authorization and token
-exchange, then validates Google's ID token and obtains claims from Google's UserInfo endpoint.
+oauthmux callback. Each pool talks to the same relay for authorization and token exchange. That
+relay references the shared Google upstream, while Cognito validates Google's ID token and obtains
+claims from Google's UserInfo endpoint.
 
 <Mermaid
-  label="Multiple Cognito user pools share one oauthmux instance and one stable callback registered with Google."
+  label="Multiple Cognito user pools use one relay backed by one Google upstream and one stable callback registered with Google."
   chart={`flowchart LR
     B[Browser]
-    C1[Cognito pool A]
-    C2[Cognito pool B]
-    CN[Cognito pool N]
+    C[Cognito user pools]
     M[oauthmux]
     G[Google OAuth]
 
-    B --> C1
-    B --> C2
-    B --> CN
-    C1 -->|authorize and token| M
-    C2 -->|authorize and token| M
-    CN -->|authorize and token| M
+    B --> C
+    C -->|authorize and token| M
     M -->|authorize and code exchange| G
     G -->|oauthmux callback| M
-    M -->|Google-signed tokens| C1
-    M -->|Google-signed tokens| C2
-    M -->|Google-signed tokens| CN
-    C1 -.->|JWKS and UserInfo| G
-    C2 -.->|JWKS and UserInfo| G
-    CN -.->|JWKS and UserInfo| G`}
+    M -->|Google-signed tokens| C
+    C -.->|JWKS and UserInfo| G`}
 />
 
 ## Why oauthmux fits this topology
@@ -43,7 +34,7 @@ Google sees one OAuth client and one allowed redirect URL regardless of how many
 it:
 
 ```text
-https://login.example.com/oidc/google/callback
+https://login.example.com/oidc/upstreams/google/callback
 ```
 
 oauthmux remembers which validated Cognito `/oauth2/idpresponse` URL started each flow and returns
@@ -51,9 +42,11 @@ the result to that pool. All participating pools share the Google client ID, con
 scopes, and oauthmux downstream client credential. Their callback origins remain explicit in the
 oauthmux allow-list.
 
-Use one oauthmux instance for this shared Google client. Creating an instance per pool produces a
-different oauthmux callback per instance and removes the single-callback benefit. Separate
-instances are appropriate when pools require independent Google clients, scopes, or operational
+Use one `google` upstream for the shared Google OAuth client and one `cognito-google` relay when
+the pools share scopes, downstream authentication, and redirect policy. Additional relays can
+reference the same upstream when those policies differ; they retain the same Google callback.
+Separate upstreams represent independent Google OAuth client registrations and therefore have
+independent callbacks and credentials. Separate oauthmux deployments provide operational
 isolation.
 
 ## The three configurations
@@ -61,54 +54,78 @@ isolation.
 ### 1. Google OAuth client
 
 Create a web OAuth client in the Google project. Register exactly the stable callback for the
-shared oauthmux instance:
+shared upstream:
 
 ```text
-https://login.example.com/oidc/google/callback
+https://login.example.com/oidc/upstreams/google/callback
 ```
 
 The client needs the OpenID Connect scopes Cognito will request, normally `openid`, `email`, and
 `profile`. Keep the Google client ID and secret available for both the oauthmux upstream
 configuration and the Cognito provider configuration.
 
-### 2. oauthmux instance
+### 2. oauthmux resources
 
-Configure Google as the upstream issuer and permit the hosted-domain origin of every participating
-Cognito pool. The shared-secret client authentication values match the credentials each pool
-sends to oauthmux's token endpoint.
+Configure Google as the upstream and reference it from a relay that permits the hosted-domain
+origin of every participating Cognito pool. `UpstreamClient` authentication checks the credentials
+each pool sends to oauthmux against the Google OAuth client credentials.
 
 ```yaml
-instances:
-  google:
-    issuer_url: https://accounts.google.com
-    authorization_endpoint: https://accounts.google.com/o/oauth2/v2/auth
-    token_endpoint: https://oauth2.googleapis.com/token
-    jwks_uri: https://www.googleapis.com/oauth2/v3/certs
-    client_id: 123456789.apps.googleusercontent.com
-    client_secret: ${GOOGLE_CLIENT_SECRET}
-    scopes: [openid, email, profile]
-    allowed_scopes: [openid, email, profile]
-    allowed_redirect_origins:
+apiVersion: oauthmux.dev/v1alpha1
+kind: Upstream
+metadata:
+  name: google
+spec:
+  issuerUrl: https://accounts.google.com
+  endpoints:
+    authorization: https://accounts.google.com/o/oauth2/v2/auth
+    token: https://oauth2.googleapis.com/token
+    jwks: https://www.googleapis.com/oauth2/v3/certs
+  oauthClient:
+    clientId: 123456789.apps.googleusercontent.com
+    clientSecret:
+      valueFrom:
+        env:
+          name: GOOGLE_CLIENT_SECRET
+---
+apiVersion: oauthmux.dev/v1alpha1
+kind: Relay
+metadata:
+  name: cognito-google
+spec:
+  upstreamRef:
+    name: google
+  scopes:
+    default: [openid, email, profile]
+    allowed: [openid, email, profile]
+  clientAuthentication:
+    type: UpstreamClient
+  redirectPolicy:
+    allowedOrigins:
       - https://pool-a.auth.eu-west-1.amazoncognito.com
       - https://pool-b.auth.us-east-1.amazoncognito.com
       - https://login.product.example
-    client_auth:
-      mode: client_secret
-      client_id: 123456789.apps.googleusercontent.com
-      client_secret: ${GOOGLE_CLIENT_SECRET}
 ```
 
 The allow-list contains origins, not paths. A pool's actual redirect ends in
 `/oauth2/idpresponse`, and oauthmux validates its origin before starting the flow.
 
-### Store the shared instance in SSM
+### Store the shared upstream in SSM
 
 For Lambda deployments, the SSM provider is a good fit for an allow-list that changes as Cognito
-pools are created. Store one SecureString parameter named `/oauthmux/instances/google`; its value
-is the `google` instance document above without the outer `instances` and `google` keys. Add each
-pool origin to that single document rather than creating one oauthmux instance per pool. Replace
-the `${GOOGLE_CLIENT_SECRET}` references with the secret value inside the encrypted parameter;
-the SSM provider receives the decrypted document and does not expand environment variables.
+pools are created. Store the complete documents as `String` parameters named
+`/oauthmux/upstreams/google` and `/oauthmux/relays/cognito-google`. Add each pool origin to the
+relay document. Store the Google secret separately as a `SecureString`, for example
+`/oauthmux/secrets/google-client-secret`, and use this source in the upstream document:
+
+```yaml
+clientSecret:
+  valueFrom:
+    ssmParameter:
+      name: /oauthmux/secrets/google-client-secret
+```
+
+An AWS Secrets Manager reference with `secretId` and optional `jsonKey` is also supported.
 
 oauthmux loads the initial snapshot during Lambda cold start. A warm execution environment checks
 the snapshot age before every invocation and synchronously reloads providers once it reaches
@@ -119,7 +136,7 @@ first invocation after the TTL expires; no background timer is required while La
 ### 3. Cognito OIDC provider
 
 Add an OIDC provider to each user pool using manual input. Keep trust fields pointed at Google and
-route only the authorization and token fields through the shared oauthmux instance.
+route only the authorization and token fields through the `cognito-google` relay.
 
 ```json
 {
@@ -128,8 +145,8 @@ route only the authorization and token fields through the shared oauthmux instan
     "client_secret": "<Google OAuth client secret>",
     "authorize_scopes": "openid email profile",
     "oidc_issuer": "https://accounts.google.com",
-    "authorize_url": "https://login.example.com/oidc/google/authorize",
-    "token_url": "https://login.example.com/oidc/google/token",
+    "authorize_url": "https://login.example.com/oidc/cognito-google/authorize",
+    "token_url": "https://login.example.com/oidc/cognito-google/token",
     "attributes_url": "https://openidconnect.googleapis.com/v1/userinfo",
     "attributes_request_method": "GET",
     "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs"
@@ -145,7 +162,7 @@ and include it in the hosted UI's identity-provider choices.
 - Google lists the oauthmux callback, not Cognito's `/oauth2/idpresponse`, as its redirect URI.
 - oauthmux allows the exact hosted-domain origin of every participating pool.
 - Cognito's issuer, JWKS, and UserInfo fields point directly to Google.
-- Cognito's authorization and token fields point to the same oauthmux instance.
+- Cognito's authorization and token fields point to the `cognito-google` relay.
 - The Google client ID is Cognito's provider client ID so the Google ID token audience is valid.
 
 oauthmux forwards Cognito's nonce to Google and returns Google's token response unchanged. Cognito

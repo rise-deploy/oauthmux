@@ -1,0 +1,414 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ResourceDocument",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "apiVersion": {
+          "$ref": "#/$defs/ApiVersion"
+        },
+        "kind": {
+          "type": "string",
+          "const": "Upstream"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "$ref": "#/$defs/UpstreamResourceSpec"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "apiVersion",
+        "metadata",
+        "spec"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "apiVersion": {
+          "$ref": "#/$defs/ApiVersion"
+        },
+        "kind": {
+          "type": "string",
+          "const": "Relay"
+        },
+        "metadata": {
+          "$ref": "#/$defs/Metadata"
+        },
+        "spec": {
+          "$ref": "#/$defs/RelayResourceSpec"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "apiVersion",
+        "metadata",
+        "spec"
+      ]
+    }
+  ],
+  "$defs": {
+    "ApiVersion": {
+      "type": "string",
+      "enum": [
+        "oauthmux.dev/v1alpha1"
+      ]
+    },
+    "ClientAuthentication": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "UpstreamClient"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "Public"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "type": "string"
+            },
+            "clientSecret": {
+              "$ref": "#/$defs/SecretValue"
+            },
+            "type": {
+              "type": "string",
+              "const": "ClientSecret"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "clientId",
+            "clientSecret"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "clientId": {
+              "type": "string"
+            },
+            "jwks": true,
+            "type": {
+              "type": "string",
+              "const": "PrivateKeyJwt"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "clientId",
+            "jwks"
+          ]
+        }
+      ]
+    },
+    "InlineSecret": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "value"
+      ]
+    },
+    "Metadata": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "OAuthClient": {
+      "type": "object",
+      "properties": {
+        "clientId": {
+          "type": "string"
+        },
+        "clientSecret": {
+          "$ref": "#/$defs/SecretValue"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "clientId",
+        "clientSecret"
+      ]
+    },
+    "RedirectPolicy": {
+      "type": "object",
+      "properties": {
+        "allowedOrigins": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "defaultRedirectUri": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "ReferencedSecret": {
+      "type": "object",
+      "properties": {
+        "valueFrom": {
+          "$ref": "#/$defs/SecretSource"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "valueFrom"
+      ]
+    },
+    "RelayResourceSpec": {
+      "type": "object",
+      "properties": {
+        "clientAuthentication": {
+          "$ref": "#/$defs/ClientAuthentication"
+        },
+        "redirectPolicy": {
+          "$ref": "#/$defs/RedirectPolicy"
+        },
+        "scopes": {
+          "$ref": "#/$defs/ScopePolicy"
+        },
+        "upstreamRef": {
+          "$ref": "#/$defs/ResourceReference"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "upstreamRef",
+        "clientAuthentication"
+      ]
+    },
+    "ResourceReference": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "ScopePolicy": {
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "default": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SecretSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "env": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "env"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "file": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "path"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "file"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ssmParameter": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ssmParameter"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "secretsManager": {
+              "type": "object",
+              "properties": {
+                "jsonKey": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "default": null
+                },
+                "secretId": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "secretId"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "secretsManager"
+          ]
+        }
+      ]
+    },
+    "SecretValue": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/InlineSecret"
+        },
+        {
+          "$ref": "#/$defs/ReferencedSecret"
+        }
+      ]
+    },
+    "UpstreamEndpoints": {
+      "type": "object",
+      "properties": {
+        "authorization": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "jwks": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "token": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "UpstreamResourceSpec": {
+      "type": "object",
+      "properties": {
+        "endpoints": {
+          "$ref": "#/$defs/UpstreamEndpoints"
+        },
+        "issuerUrl": {
+          "type": "string"
+        },
+        "oauthClient": {
+          "$ref": "#/$defs/OAuthClient"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "issuerUrl",
+        "oauthClient"
+      ]
+    }
+  }
+}

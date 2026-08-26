@@ -8,11 +8,11 @@ use axum::{
 use axum::{http::StatusCode, routing::get, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use oauthmux_core::{
-    router, ConfigProvider, KeyStrategy, MemoryReplayCache, MuxConfig, ProviderSnapshot, Registry,
-    XChaChaSealer,
+    resource_schema, router, ConfigProvider, KeyStrategy, MemoryReplayCache, MuxConfig,
+    ProviderSnapshot, Registry, XChaChaSealer,
 };
 use oauthmux_provider_file::FileProvider;
-use oauthmux_provider_ssm::{AwsSsmClient, SsmProvider};
+use oauthmux_provider_ssm::{AwsSecretsManagerClient, AwsSsmClient, SsmProvider};
 #[cfg(feature = "lambda")]
 use std::time::SystemTime;
 use std::{
@@ -64,6 +64,10 @@ const DEFAULT_LAMBDA_CONFIG_TTL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if env::args().nth(1).as_deref() == Some("schema") {
+        println!("{}", serde_json::to_string_pretty(&resource_schema())?);
+        return Ok(());
+    }
     init_tracing();
     let public_url = required_url("OAUTHMUX_PUBLIC_URL")?;
     let current = seal_key("OAUTHMUX_SEAL_KEY", true)?.expect("required key");
@@ -152,9 +156,13 @@ async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> 
     }
     if let Ok(prefix) = env::var("OAUTHMUX_PROVIDER_SSM_PREFIX") {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = Arc::new(AwsSsmClient(aws_sdk_ssm_client(config)));
+        let client = Arc::new(AwsSsmClient(aws_sdk_ssm_client(&config)));
+        let secrets_manager = Arc::new(AwsSecretsManagerClient(
+            aws_sdk_secretsmanager::Client::new(&config),
+        ));
         providers.push(Arc::new(SsmProvider::new(
             client,
+            secrets_manager,
             prefix,
             duration_env("OAUTHMUX_PROVIDER_SSM_POLL", Duration::from_secs(60))?,
         )?));
@@ -162,8 +170,8 @@ async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> 
     Ok(providers)
 }
 
-fn aws_sdk_ssm_client(config: aws_config::SdkConfig) -> aws_sdk_ssm::Client {
-    aws_sdk_ssm::Client::new(&config)
+fn aws_sdk_ssm_client(config: &aws_config::SdkConfig) -> aws_sdk_ssm::Client {
+    aws_sdk_ssm::Client::new(config)
 }
 
 fn start_providers(providers: Vec<Arc<dyn ConfigProvider>>) -> Vec<RunningProvider> {
@@ -394,7 +402,7 @@ mod tests {
     #[cfg(feature = "lambda")]
     use async_trait::async_trait;
     #[cfg(feature = "lambda")]
-    use oauthmux_core::{ClientAuth, Instance, InstanceKey, SecretString, UpstreamSpec};
+    use oauthmux_core::{ClientAuth, Relay, ResourceKey, SecretString, Upstream};
 
     #[cfg(feature = "lambda")]
     use std::sync::atomic::AtomicUsize;
@@ -406,27 +414,28 @@ mod tests {
 
     #[cfg(feature = "lambda")]
     fn snapshot(key_text: &str) -> ProviderSnapshot {
-        let key = InstanceKey::new(key_text).unwrap();
-        let instance = Arc::new(Instance {
+        let key = ResourceKey::new(key_text).unwrap();
+        let upstream = Arc::new(Upstream {
             key: key.clone(),
-            upstream: UpstreamSpec {
-                issuer_url: Url::parse("https://issuer.example").unwrap(),
-                authorization_endpoint: Some(
-                    Url::parse("https://issuer.example/authorize").unwrap(),
-                ),
-                token_endpoint: Some(Url::parse("https://issuer.example/token").unwrap()),
-                jwks_uri: None,
-                client_id: "upstream".into(),
-                client_secret: SecretString::new("secret"),
-                scopes: vec![],
-                allowed_scopes: None,
-            },
+            issuer_url: Url::parse("https://issuer.example").unwrap(),
+            authorization_endpoint: Some(Url::parse("https://issuer.example/authorize").unwrap()),
+            token_endpoint: Some(Url::parse("https://issuer.example/token").unwrap()),
+            jwks_uri: None,
+            client_id: "upstream".into(),
+            client_secret: SecretString::new("secret"),
+        });
+        let relay = Arc::new(Relay {
+            key: key.clone(),
+            upstream: key.clone(),
             client_auth: ClientAuth::Public,
+            scopes: vec![],
+            allowed_scopes: None,
             allowed_redirect_origins: vec![],
             default_redirect_uri: None,
         });
         let mut snapshot = ProviderSnapshot::default();
-        snapshot.instances.insert(key, instance);
+        snapshot.upstreams.insert(key.clone(), upstream);
+        snapshot.relays.insert(key, relay);
         snapshot
     }
 
@@ -475,19 +484,22 @@ mod tests {
         refresher.refresh_if_stale().await;
         assert!(registry
             .snapshot()
-            .contains_key(&InstanceKey::new("initial").unwrap()));
+            .relays
+            .contains_key(&ResourceKey::new("initial").unwrap()));
 
         refresher.state.lock().await.last_attempt = SystemTime::now() - DEFAULT_LAMBDA_CONFIG_TTL;
         refresher.refresh_if_stale().await;
         assert!(registry
             .snapshot()
-            .contains_key(&InstanceKey::new("refreshed").unwrap()));
+            .relays
+            .contains_key(&ResourceKey::new("refreshed").unwrap()));
 
         refresher.state.lock().await.last_attempt = SystemTime::now() - DEFAULT_LAMBDA_CONFIG_TTL;
         refresher.refresh_if_stale().await;
         assert!(registry
             .snapshot()
-            .contains_key(&InstanceKey::new("refreshed").unwrap()));
+            .relays
+            .contains_key(&ResourceKey::new("refreshed").unwrap()));
         assert_eq!(DEFAULT_LAMBDA_CONFIG_TTL, Duration::from_secs(60));
     }
 }

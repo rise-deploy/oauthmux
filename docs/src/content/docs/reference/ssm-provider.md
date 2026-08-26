@@ -80,6 +80,11 @@ name with decryption enabled.
 
 ## Secrets Manager reference
 
+`secretId` accepts either a secret name or a full Secrets Manager ARN and is passed unchanged to
+`GetSecretValue`. A name resolves in the configured AWS account and region. Use a full ARN for a
+cross-account secret or when the configuration should identify one exact secret; avoid partial
+ARNs.
+
 Without `jsonKey`, the complete `SecretString` is the client secret:
 
 ```yaml

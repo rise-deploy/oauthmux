@@ -1,5 +1,7 @@
 [tools]
 actionlint = "1.7.12"
+aws-cli = "2.36.24"
+docker-cli = "29.7.2"
 node = "24.19.0"
 rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 shellcheck = "0.11.0"
@@ -13,6 +15,7 @@ run = [
   "mise run features:check",
   "cargo test --workspace --all-features",
   "mise run schema:check",
+  "mise run scripts:test",
   "mise run docs",
 ]
 
@@ -45,3 +48,11 @@ run = "npm ci && npm run dev"
 [tasks.e2e]
 description = "Run Docker-backed end-to-end tests"
 run = "bash tests/e2e/run.sh"
+
+[tasks."e2e:aws-google"]
+description = "Verify a published oauthmux image with AWS Lambda and Google OAuth"
+run = "node scripts/aws-google-relay-e2e.mjs"
+
+[tasks."scripts:test"]
+description = "Run orchestration script tests"
+run = "node --test scripts/*.test.mjs"

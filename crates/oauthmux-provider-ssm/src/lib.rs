@@ -145,6 +145,10 @@ impl<C: SsmClient> ConfigProvider for SsmProvider<C> {
         "ssm"
     }
 
+    async fn load(&self) -> anyhow::Result<ProviderSnapshot> {
+        SsmProvider::load(self).await
+    }
+
     async fn run(self: Arc<Self>, tx: watch::Sender<ProviderSnapshot>) -> anyhow::Result<()> {
         let mut has_sent = false;
         loop {

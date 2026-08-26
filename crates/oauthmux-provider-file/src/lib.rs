@@ -53,6 +53,10 @@ impl ConfigProvider for FileProvider {
         "file"
     }
 
+    async fn load(&self) -> anyhow::Result<ProviderSnapshot> {
+        FileProvider::load(self).await
+    }
+
     async fn run(self: Arc<Self>, tx: watch::Sender<ProviderSnapshot>) -> anyhow::Result<()> {
         let first = self.load().await?;
         tx.send(first)

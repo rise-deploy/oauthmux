@@ -1,4 +1,10 @@
 use anyhow::{anyhow, Context};
+#[cfg(feature = "lambda")]
+use axum::{
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::Response,
+};
 use axum::{http::StatusCode, routing::get, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use oauthmux_core::{
@@ -7,6 +13,8 @@ use oauthmux_core::{
 };
 use oauthmux_provider_file::FileProvider;
 use oauthmux_provider_ssm::{AwsSsmClient, SsmProvider};
+#[cfg(feature = "lambda")]
+use std::time::SystemTime;
 use std::{
     env,
     io::IsTerminal,
@@ -17,13 +25,42 @@ use std::{
     time::Duration,
 };
 use tokio::sync::watch;
+#[cfg(feature = "lambda")]
+use tokio::sync::Mutex;
 use url::Url;
 
 struct RunningProvider {
     name: String,
+    #[cfg(feature = "lambda")]
+    provider: Arc<dyn ConfigProvider>,
     rx: watch::Receiver<ProviderSnapshot>,
+    #[cfg(feature = "lambda")]
     task: tokio::task::JoinHandle<()>,
 }
+
+#[cfg(feature = "lambda")]
+struct LambdaProvider {
+    name: String,
+    provider: Arc<dyn ConfigProvider>,
+    snapshot: ProviderSnapshot,
+}
+
+#[cfg(feature = "lambda")]
+struct LambdaRefreshState {
+    // Wall time includes intervals while Lambda has frozen the process.
+    last_attempt: SystemTime,
+    providers: Vec<LambdaProvider>,
+}
+
+#[cfg(feature = "lambda")]
+struct LambdaConfigRefresher {
+    registry: Arc<Registry>,
+    ttl: Duration,
+    state: Mutex<LambdaRefreshState>,
+}
+
+#[cfg(feature = "lambda")]
+const DEFAULT_LAMBDA_CONFIG_TTL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -72,12 +109,16 @@ async fn main() -> anyhow::Result<()> {
         .merge(mux);
 
     if is_lambda_runtime() {
-        // Lambda providers are cold-start loaders; background polling is unreliable across freezes.
-        for provider in running {
-            provider.task.abort();
-        }
         #[cfg(feature = "lambda")]
         {
+            // Lambda refreshes providers at invocation boundaries because it freezes between requests.
+            let refresh_ttl =
+                duration_env("OAUTHMUX_LAMBDA_CONFIG_TTL", DEFAULT_LAMBDA_CONFIG_TTL)?;
+            let refresher = Arc::new(LambdaConfigRefresher::new(registry, running, refresh_ttl));
+            let app = app.layer(middleware::from_fn_with_state(
+                refresher,
+                refresh_lambda_config,
+            ));
             tracing::info!("starting AWS Lambda runtime");
             lambda_http::run(app)
                 .await
@@ -132,14 +173,92 @@ fn start_providers(providers: Vec<Arc<dyn ConfigProvider>>) -> Vec<RunningProvid
             let name = provider.name().to_owned();
             let (tx, rx) = watch::channel(ProviderSnapshot::default());
             let log_name = name.clone();
+            let task_provider = provider.clone();
             let task = tokio::spawn(async move {
-                if let Err(error) = provider.run(tx).await {
+                if let Err(error) = task_provider.run(tx).await {
                     tracing::error!(provider = %log_name, %error, "config provider stopped");
                 }
             });
-            RunningProvider { name, rx, task }
+            #[cfg(not(feature = "lambda"))]
+            drop(task);
+            RunningProvider {
+                name,
+                #[cfg(feature = "lambda")]
+                provider,
+                rx,
+                #[cfg(feature = "lambda")]
+                task,
+            }
         })
         .collect()
+}
+
+#[cfg(feature = "lambda")]
+impl LambdaConfigRefresher {
+    fn new(registry: Arc<Registry>, providers: Vec<RunningProvider>, ttl: Duration) -> Self {
+        let providers = providers
+            .into_iter()
+            .map(|running| {
+                running.task.abort();
+                LambdaProvider {
+                    name: running.name,
+                    provider: running.provider,
+                    snapshot: running.rx.borrow().clone(),
+                }
+            })
+            .collect();
+        Self {
+            registry,
+            ttl,
+            state: Mutex::new(LambdaRefreshState {
+                last_attempt: SystemTime::now(),
+                providers,
+            }),
+        }
+    }
+
+    async fn refresh_if_stale(&self) {
+        let mut state = self.state.lock().await;
+        let is_fresh = SystemTime::now()
+            .duration_since(state.last_attempt)
+            .is_ok_and(|age| age < self.ttl);
+        if is_fresh {
+            return;
+        }
+        state.last_attempt = SystemTime::now();
+
+        for provider in &mut state.providers {
+            match provider.provider.load().await {
+                Ok(snapshot) => provider.snapshot = snapshot,
+                Err(error) => {
+                    tracing::error!(
+                        provider = %provider.name,
+                        %error,
+                        "Lambda provider refresh failed; keeping last good snapshot"
+                    );
+                }
+            }
+        }
+
+        let snapshots: Vec<_> = state
+            .providers
+            .iter()
+            .map(|provider| (provider.name.as_str(), &provider.snapshot))
+            .collect();
+        self.registry.replace(Registry::merge_ordered(
+            snapshots.iter().map(|(name, snapshot)| (*name, *snapshot)),
+        ));
+    }
+}
+
+#[cfg(feature = "lambda")]
+async fn refresh_lambda_config(
+    State(refresher): State<Arc<LambdaConfigRefresher>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    refresher.refresh_if_stale().await;
+    next.run(request).await
 }
 
 async fn await_initial_snapshots(providers: &mut [RunningProvider]) -> anyhow::Result<()> {
@@ -272,40 +391,62 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lambda")]
     use async_trait::async_trait;
+    #[cfg(feature = "lambda")]
     use oauthmux_core::{ClientAuth, Instance, InstanceKey, SecretString, UpstreamSpec};
 
-    struct ColdStartProvider;
+    #[cfg(feature = "lambda")]
+    use std::sync::atomic::AtomicUsize;
 
+    #[cfg(feature = "lambda")]
+    struct ReloadingProvider {
+        loads: AtomicUsize,
+    }
+
+    #[cfg(feature = "lambda")]
+    fn snapshot(key_text: &str) -> ProviderSnapshot {
+        let key = InstanceKey::new(key_text).unwrap();
+        let instance = Arc::new(Instance {
+            key: key.clone(),
+            upstream: UpstreamSpec {
+                issuer_url: Url::parse("https://issuer.example").unwrap(),
+                authorization_endpoint: Some(
+                    Url::parse("https://issuer.example/authorize").unwrap(),
+                ),
+                token_endpoint: Some(Url::parse("https://issuer.example/token").unwrap()),
+                jwks_uri: None,
+                client_id: "upstream".into(),
+                client_secret: SecretString::new("secret"),
+                scopes: vec![],
+                allowed_scopes: None,
+            },
+            client_auth: ClientAuth::Public,
+            allowed_redirect_origins: vec![],
+            default_redirect_uri: None,
+        });
+        let mut snapshot = ProviderSnapshot::default();
+        snapshot.instances.insert(key, instance);
+        snapshot
+    }
+
+    #[cfg(feature = "lambda")]
     #[async_trait]
-    impl ConfigProvider for ColdStartProvider {
+    impl ConfigProvider for ReloadingProvider {
         fn name(&self) -> &str {
-            "cold-start-test"
+            "reload-test"
+        }
+
+        async fn load(&self) -> anyhow::Result<ProviderSnapshot> {
+            match self.loads.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(snapshot("initial")),
+                1 => Ok(snapshot("refreshed")),
+                _ => Err(anyhow!("refresh failed")),
+            }
         }
 
         async fn run(self: Arc<Self>, tx: watch::Sender<ProviderSnapshot>) -> anyhow::Result<()> {
-            let key = InstanceKey::new("lambda").unwrap();
-            let instance = Arc::new(Instance {
-                key: key.clone(),
-                upstream: UpstreamSpec {
-                    issuer_url: Url::parse("https://issuer.example").unwrap(),
-                    authorization_endpoint: Some(
-                        Url::parse("https://issuer.example/authorize").unwrap(),
-                    ),
-                    token_endpoint: Some(Url::parse("https://issuer.example/token").unwrap()),
-                    jwks_uri: None,
-                    client_id: "upstream".into(),
-                    client_secret: SecretString::new("secret"),
-                    scopes: vec![],
-                    allowed_scopes: None,
-                },
-                client_auth: ClientAuth::Public,
-                allowed_redirect_origins: vec![],
-                default_redirect_uri: None,
-            });
-            let mut snapshot = ProviderSnapshot::default();
-            snapshot.instances.insert(key, instance);
-            tx.send(snapshot)?;
+            tx.send(self.load().await?)?;
             std::future::pending().await
         }
     }
@@ -319,17 +460,34 @@ mod tests {
         assert!(parse_duration("TEST", "0s").is_err());
     }
 
+    #[cfg(feature = "lambda")]
     #[tokio::test]
-    async fn lambda_cold_start_keeps_snapshot_after_provider_task_stops() {
+    async fn lambda_refreshes_stale_configuration_and_keeps_last_good_snapshot() {
         let registry = Arc::new(Registry::default());
-        let mut providers = start_providers(vec![Arc::new(ColdStartProvider)]);
+        let provider = Arc::new(ReloadingProvider {
+            loads: AtomicUsize::new(0),
+        });
+        let mut providers = start_providers(vec![provider]);
         await_initial_snapshots(&mut providers).await.unwrap();
         replace_registry(&registry, &providers);
-        for provider in providers {
-            provider.task.abort();
-        }
+        let refresher =
+            LambdaConfigRefresher::new(registry.clone(), providers, DEFAULT_LAMBDA_CONFIG_TTL);
+        refresher.refresh_if_stale().await;
         assert!(registry
             .snapshot()
-            .contains_key(&InstanceKey::new("lambda").unwrap()));
+            .contains_key(&InstanceKey::new("initial").unwrap()));
+
+        refresher.state.lock().await.last_attempt = SystemTime::now() - DEFAULT_LAMBDA_CONFIG_TTL;
+        refresher.refresh_if_stale().await;
+        assert!(registry
+            .snapshot()
+            .contains_key(&InstanceKey::new("refreshed").unwrap()));
+
+        refresher.state.lock().await.last_attempt = SystemTime::now() - DEFAULT_LAMBDA_CONFIG_TTL;
+        refresher.refresh_if_stale().await;
+        assert!(registry
+            .snapshot()
+            .contains_key(&InstanceKey::new("refreshed").unwrap()));
+        assert_eq!(DEFAULT_LAMBDA_CONFIG_TTL, Duration::from_secs(60));
     }
 }

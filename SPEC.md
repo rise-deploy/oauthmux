@@ -152,6 +152,8 @@ pub trait InstanceResolver: Send + Sync + 'static {
 #[async_trait]
 pub trait ConfigProvider: Send + Sync + 'static {
     fn name(&self) -> &str;
+    /// Produce one complete snapshot for startup or invocation-driven refresh.
+    async fn load(&self) -> anyhow::Result<ProviderSnapshot>;
     /// Long-running task: send a full snapshot of this provider's instances
     /// whenever they (may) have changed. First send completes startup readiness.
     async fn run(self: Arc<Self>, tx: watch::Sender<ProviderSnapshot>) -> anyhow::Result<()>;
@@ -312,6 +314,7 @@ OAUTHMUX_PROVIDER_FILE=/etc/oauthmux/config.yaml # enables file provider
 OAUTHMUX_PROVIDER_FILE_POLL=30s
 OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/instances/ # enables SSM provider
 OAUTHMUX_PROVIDER_SSM_POLL=60s
+OAUTHMUX_LAMBDA_CONFIG_TTL=60s                  # invocation-driven provider refresh
 OAUTHMUX_LOG=info                                # tracing filter
 ```
 
@@ -354,9 +357,9 @@ Multi-stage build to a single static binary:
    (RFC 7523 assertion verification, inline JWKS and JWKS URL with caching).
 3. **M3 — image + release.** Dockerfile per §8, multi-arch CI publish, versioned release
    workflow, operator docs (IAM policy snippet, key rotation runbook, replay-cache caveat).
-4. **M4 (stretch, do not start unasked) — Lambda mode.** `lambda` feature on the binary crate
-   using `lambda_http` over the same router. Design constraint honored throughout: no background
-   state beyond the provider registry; providers must tolerate load-once-per-cold-start usage.
+4. **M4 — Lambda mode.** The binary uses `lambda_http` over the same router. Provider snapshots
+   load during cold start and refresh synchronously at invocation boundaries after a configurable
+   TTL. Each provider retains its last valid snapshot when a refresh fails.
 
 ## 11. Non-goals
 

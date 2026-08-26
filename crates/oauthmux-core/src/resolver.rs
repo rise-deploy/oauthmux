@@ -26,6 +26,8 @@ pub struct ProviderSnapshot {
 #[async_trait]
 pub trait ConfigProvider: Send + Sync + 'static {
     fn name(&self) -> &str;
+    /// Produces one complete snapshot for startup or invocation-driven refresh.
+    async fn load(&self) -> anyhow::Result<ProviderSnapshot>;
     async fn run(self: Arc<Self>, tx: watch::Sender<ProviderSnapshot>) -> anyhow::Result<()>;
 }
 

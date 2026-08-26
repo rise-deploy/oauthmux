@@ -200,6 +200,7 @@ collision is logged, and the File instance remains active.
 | `OAUTHMUX_PROVIDER_FILE_POLL` | File mtime poll interval | `30s` |
 | `OAUTHMUX_PROVIDER_SSM_PREFIX` | SSM hierarchy ending in `/` | disabled |
 | `OAUTHMUX_PROVIDER_SSM_POLL` | SSM poll interval | `60s` |
+| `OAUTHMUX_LAMBDA_CONFIG_TTL` | Maximum age before an invocation refreshes provider snapshots | `60s` |
 | `OAUTHMUX_LOG` | `tracing` filter | `info` |
 
 At least one provider must be enabled. Native mode exposes `/healthz` and reports `/readyz` only
@@ -210,9 +211,11 @@ SIGINT and logs JSON when stdout is not a terminal.
 
 The same image enters Lambda mode when `AWS_LAMBDA_RUNTIME_API` is present. Provider initialization
 is part of the cold start: all first snapshots, normally from SSM, are merged into the registry
-before the Lambda event loop starts. Provider poll tasks then stop because Lambda can freeze an
-execution environment between requests. Each new execution environment loads a current SSM
-snapshot. The handler and native server use the same Axum router.
+before the Lambda event loop starts. Before handling an invocation, oauthmux synchronously reloads
+provider snapshots when they are at least `OAUTHMUX_LAMBDA_CONFIG_TTL` old. Successful providers
+replace their snapshots; a failed provider retains its last valid snapshot. Invocation-driven
+refresh works across Lambda freezes and bounds configuration staleness without an SSM request on
+every invocation. The handler and native server use the same Axum router.
 
 Configure an API Gateway HTTP API or Lambda Function URL to forward every route to the image. Set
 `OAUTHMUX_PUBLIC_URL` to that external URL and give the function role the SSM/KMS permissions

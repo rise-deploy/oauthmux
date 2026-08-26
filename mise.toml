@@ -1,5 +1,5 @@
 [tools]
-rust = "1.97.1"
+rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 
 [tasks.check]
 description = "Run all local quality gates"

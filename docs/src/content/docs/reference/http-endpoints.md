@@ -3,17 +3,18 @@ title: HTTP endpoints
 description: Reference for oauthmux relay, callback, metadata, and health routes.
 ---
 
-For relay name `R` referencing upstream name `U`, oauthmux serves:
+`OAUTHMUX_PUBLIC_URL` is the complete base `B` for the OAuth API. For relay name `R` referencing
+upstream name `U`, oauthmux serves:
 
 | Method and route | Behavior |
 | --- | --- |
-| `GET /oidc/{R}/authorize` | Validates redirect and scope policy, creates independent upstream state and S256 PKCE, then redirects to the upstream. |
-| `GET /oidc/upstreams/{U}/callback` | Validates upstream-bound state, exchanges the upstream code, and returns a sealed code to the originating relay redirect. |
-| `POST /oidc/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, and PKCE, then returns the stored upstream response unchanged. |
-| `POST /oidc/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. |
-| `OPTIONS /oidc/{R}/token` | Returns CORS headers only for an allowed origin. |
-| `GET /oidc/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
-| `GET /oidc/{R}/jwks` | Proxies the referenced upstream JWKS. |
+| `GET {B}/relay/{R}/authorize` | Validates redirect and scope policy, creates independent upstream state and S256 PKCE, then redirects to the upstream. |
+| `GET {B}/upstream/{U}/callback` | Validates upstream-bound state, exchanges the upstream code, and returns a sealed code to the originating relay redirect. |
+| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, and PKCE, then returns the stored upstream response unchanged. |
+| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. |
+| `OPTIONS {B}/relay/{R}/token` | Returns CORS headers only for an allowed origin. |
+| `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
+| `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
 | `GET /healthz` | Reports standalone process liveness. |
 | `GET /readyz` | Reports readiness after initial provider snapshots are available. |
 

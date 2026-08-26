@@ -385,6 +385,9 @@ fn required_url(name: &str) -> anyhow::Result<Url> {
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(anyhow!("{name} must be an absolute http(s) URL"));
     }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(anyhow!("{name} must not contain a query or fragment"));
+    }
     Ok(url)
 }
 

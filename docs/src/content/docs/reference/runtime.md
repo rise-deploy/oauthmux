@@ -10,7 +10,7 @@ every configured provider before serving traffic.
 
 | Variable | Required | Default | Meaning |
 | --- | --- | --- | --- |
-| `OAUTHMUX_PUBLIC_URL` | yes | — | Externally visible absolute base URL used to construct callbacks and relay endpoints. |
+| `OAUTHMUX_PUBLIC_URL` | yes | — | Complete externally visible OAuth API base used both to serve routes and construct endpoint URLs. |
 | `OAUTHMUX_SEAL_KEY` | yes | — | Raw base64 or `base64:`-prefixed 32-byte key for state and authorization-code envelopes. |
 | `OAUTHMUX_SEAL_KEY_PREVIOUS` | no | unset | Previous 32-byte key accepted while rotating envelopes. |
 | `OAUTHMUX_LISTEN` | native only | `0.0.0.0:8080` | Native server socket. |
@@ -51,7 +51,13 @@ publish that version tag.
 
 The image is a non-root, scratch-based executable listening on port 8080. Mount a File provider
 configuration or supply AWS credentials for the SSM provider. Terminate TLS at the ingress, load
-balancer, API Gateway, or Function URL, and set `OAUTHMUX_PUBLIC_URL` to the public HTTPS base URL.
+balancer, API Gateway, or Function URL, and set `OAUTHMUX_PUBLIC_URL` to the complete public HTTPS
+base for the OAuth API.
+
+The path is customizable. `https://login.example.com/oidc` serves routes below `/oidc`, while
+`https://login.example.com/services/oauthmux` serves the same routes below `/services/oauthmux`.
+Forward the public path unchanged to oauthmux. Health and readiness remain at `/healthz` and
+`/readyz`, outside the OAuth API base.
 
 ## AWS Lambda
 
@@ -70,11 +76,18 @@ includes the Lambda Runtime API client.
 
 ## Sealing-key rotation
 
-Transient state lives for ten minutes and sealed authorization codes live for five minutes. To
-rotate keys, set the new key as `OAUTHMUX_SEAL_KEY` and the active key as
-`OAUTHMUX_SEAL_KEY_PREVIOUS`. Keep the previous key available for at least ten minutes, then remove
-it after envelopes created with it have expired.
+The ten-minute flow envelope is carried by the upstream OAuth `state` parameter. The five-minute
+authorization-code envelope is returned to the application and then presented to the oauthmux
+token endpoint. Both are encrypted and authenticated client-held values; oauthmux does not store
+their contents in memory. Each envelope contains an authenticated issuance timestamp. oauthmux
+compares that timestamp with wall-clock time when opening the envelope, allowing up to 30 seconds
+of forward clock skew.
 
-The standalone runtime uses an in-memory replay cache. Authorization codes are single-use within
-one native process or one warm Lambda execution environment. Deployments requiring global
-single-use semantics need a shared `ReplayCache` implementation through the embeddable core.
+To rotate keys, set the new key as `OAUTHMUX_SEAL_KEY` and the prior key as
+`OAUTHMUX_SEAL_KEY_PREVIOUS`. Keep the prior key available for at least ten minutes, then remove it
+after envelopes created with it have expired.
+
+The standalone runtime stores only used authorization-code envelope IDs in an in-memory replay
+cache. Authorization codes are single-use within one native process or one warm Lambda execution
+environment. Deployments requiring global single-use semantics need a shared `ReplayCache`
+implementation through the embeddable core.

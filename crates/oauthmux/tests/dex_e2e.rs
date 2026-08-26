@@ -11,6 +11,7 @@ use url::Url;
 
 const DEX_ISSUER: &str = "http://127.0.0.1:15556/dex";
 const MUX_BASE: &str = "http://127.0.0.1:18080";
+const MUX_PUBLIC_URL: &str = "http://127.0.0.1:18080/oidc";
 const APP_CALLBACK: &str = "http://127.0.0.1:19090/callback";
 
 struct ChildGuard(Child);
@@ -117,7 +118,7 @@ spec:
     )
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_oauthmux"))
-        .env("OAUTHMUX_PUBLIC_URL", MUX_BASE)
+        .env("OAUTHMUX_PUBLIC_URL", MUX_PUBLIC_URL)
         .env("OAUTHMUX_LISTEN", "127.0.0.1:18080")
         .env(
             "OAUTHMUX_SEAL_KEY",
@@ -136,7 +137,7 @@ spec:
     let verifier = "dex-e2e-verifier-with-at-least-forty-three-characters";
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let nonce = "dex-e2e-nonce";
-    let mut authorize = Url::parse(&format!("{MUX_BASE}/oidc/dex/authorize")).unwrap();
+    let mut authorize = Url::parse(&format!("{MUX_PUBLIC_URL}/relay/dex/authorize")).unwrap();
     authorize
         .query_pairs_mut()
         .append_pair("response_type", "code")
@@ -153,7 +154,7 @@ spec:
     let code = parameter(&application, "code");
 
     let token = no_redirect
-        .post(format!("{MUX_BASE}/oidc/dex/token"))
+        .post(format!("{MUX_PUBLIC_URL}/relay/dex/token"))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -197,7 +198,7 @@ spec:
     assert_eq!(claims["nonce"], nonce);
 
     let refresh = no_redirect
-        .post(format!("{MUX_BASE}/oidc/dex/token"))
+        .post(format!("{MUX_PUBLIC_URL}/relay/dex/token"))
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", token["refresh_token"].as_str().unwrap()),
@@ -210,7 +211,7 @@ spec:
     assert!(refresh.json::<Value>().await.unwrap()["access_token"].is_string());
 
     let replay = no_redirect
-        .post(format!("{MUX_BASE}/oidc/dex/token"))
+        .post(format!("{MUX_PUBLIC_URL}/relay/dex/token"))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -224,7 +225,7 @@ spec:
 
     let invalid_redirect = no_redirect
         .get(format!(
-            "{MUX_BASE}/oidc/dex/authorize?redirect_uri=https%3A%2F%2Fevil.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
+            "{MUX_PUBLIC_URL}/relay/dex/authorize?redirect_uri=https%3A%2F%2Fevil.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .send()
         .await

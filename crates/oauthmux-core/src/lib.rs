@@ -8,7 +8,7 @@
 //! use std::sync::Arc;
 //! let resources = ProviderSnapshot::default(); // Populate from the host database.
 //! let config = MuxConfig {
-//!     public_url: "https://rise.example.com".parse().unwrap(),
+//!     public_url: "https://rise.example.com/oidc".parse().unwrap(),
 //!     sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
 //!     replay_cache: None,
 //!     http: reqwest::Client::new(),

@@ -441,7 +441,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
     let app = router(
         Arc::new(resources),
         MuxConfig {
-            public_url: Url::parse("https://mux.example/").unwrap(),
+            public_url: Url::parse("https://mux.example/custom/base").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
             replay_cache: None,
             http: reqwest::Client::new(),
@@ -456,13 +456,14 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
             .clone()
             .oneshot(
                 Request::get(format!(
-                    "/oidc/{relay}/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
+                    "/custom/base/relay/{relay}/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
                 ))
                 .body(Body::empty())
                 .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
         let location = Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
         assert_eq!(
             location
@@ -470,14 +471,14 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
                 .find(|(name, _)| name == "redirect_uri")
                 .unwrap()
                 .1,
-            "https://mux.example/oidc/upstreams/google/callback"
+            "https://mux.example/custom/base/upstream/google/callback"
         );
     }
 }
 
 async fn authorization_code(app: &Router, path_key: &str, challenge: Option<&str>) -> String {
     let mut uri = format!(
-        "/oidc/{path_key}/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=app-state"
+        "/relay/{path_key}/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=app-state"
     );
     if let Some(challenge) = challenge {
         uri.push_str("&code_challenge=");
@@ -534,7 +535,7 @@ async fn authorization_code(app: &Router, path_key: &str, challenge: Option<&str
 async fn post_token(app: &Router, path_key: &str, form: &str) -> Response {
     app.clone()
         .oneshot(
-            Request::post(format!("/oidc/{path_key}/token"))
+            Request::post(format!("/relay/{path_key}/token"))
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .header(header::ORIGIN, "https://app.example")
                 .body(Body::from(form.to_owned()))
@@ -636,7 +637,7 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
 async fn expired_code_and_invalid_redirect_are_rejected() {
     let (app, sealer, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;
     let invalid = app.clone().oneshot(
-        Request::get("/oidc/google/authorize?redirect_uri=https%3A%2F%2Fapp.example.evil.test%2Fcb&code_challenge=x&code_challenge_method=S256")
+        Request::get("/relay/google/authorize?redirect_uri=https%3A%2F%2Fapp.example.evil.test%2Fcb&code_challenge=x&code_challenge_method=S256")
             .body(Body::empty()).unwrap(),
     ).await.unwrap();
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
@@ -684,7 +685,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
         .clone()
         .oneshot(
             Request::get(format!(
-                "/oidc/upstreams/google/callback?code=upstream&state={state}"
+                "/upstream/google/callback?code=upstream&state={state}"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -710,7 +711,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
         .clone()
         .oneshot(
             Request::get(format!(
-                "/oidc/upstreams/google/callback?error=access_denied&state={state}"
+                "/upstream/google/callback?error=access_denied&state={state}"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -729,7 +730,7 @@ async fn upstream_authorization_errors_relay_only_to_validated_redirect() {
         .clone()
         .oneshot(
             Request::get(format!(
-                "/oidc/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=application&code_challenge={challenge}"
+                "/relay/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=application&code_challenge={challenge}"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -746,7 +747,7 @@ async fn upstream_authorization_errors_relay_only_to_validated_redirect() {
     let response = app
         .oneshot(
             Request::get(format!(
-                "/oidc/upstreams/google/callback?error=access_denied&error_description=declined&error_uri=https%3A%2F%2Fissuer.example%2Ferrors%2Fdenied&state={state}"
+                "/upstream/google/callback?error=access_denied&error_description=declined&error_uri=https%3A%2F%2Fissuer.example%2Ferrors%2Fdenied&state={state}"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -769,10 +770,10 @@ async fn exact_redirect_query_is_matched_before_results_are_appended() {
 
     for uri in [
         format!(
-            "/oidc/google/authorize?code_challenge={challenge}&code_challenge_method=S256"
+            "/relay/google/authorize?code_challenge={challenge}&code_challenge_method=S256"
         ),
         format!(
-            "/oidc/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback%3Fchannel%3Dother&code_challenge={challenge}&code_challenge_method=S256"
+            "/relay/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback%3Fchannel%3Dother&code_challenge={challenge}&code_challenge_method=S256"
         ),
     ] {
         let response = app
@@ -787,7 +788,7 @@ async fn exact_redirect_query_is_matched_before_results_are_appended() {
         .clone()
         .oneshot(
             Request::get(format!(
-                "/oidc/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback%3Fchannel%3Dstable%26next%3D%252Fhome&state=application&code_challenge={challenge}&code_challenge_method=S256"
+                "/relay/google/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback%3Fchannel%3Dstable%26next%3D%252Fhome&state=application&code_challenge={challenge}&code_challenge_method=S256"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -805,7 +806,7 @@ async fn exact_redirect_query_is_matched_before_results_are_appended() {
     let response = app
         .oneshot(
             Request::get(format!(
-                "/oidc/upstreams/google/callback?error=access_denied&state={state}"
+                "/upstream/google/callback?error=access_denied&state={state}"
             ))
             .body(Body::empty())
             .unwrap(),
@@ -844,7 +845,7 @@ async fn authorization_relay_preserves_extensions_and_applies_scope_policy() {
     )
     .await;
     let request = format!(
-        "/oidc/relay/authorize?client_id=downstream&response_type=code&response_mode=query&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=downstream-state&code_challenge={challenge}&code_challenge_method=S256&scope=email%20openid&nonce=nonce-value&prompt=consent&login_hint=user%40example.com&access_type=offline&resource=one&resource=two"
+        "/relay/relay/authorize?client_id=downstream&response_type=code&response_mode=query&redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&state=downstream-state&code_challenge={challenge}&code_challenge_method=S256&scope=email%20openid&nonce=nonce-value&prompt=consent&login_hint=user%40example.com&access_type=offline&resource=one&resource=two"
     );
     let response = app
         .clone()
@@ -874,16 +875,16 @@ async fn authorization_relay_preserves_extensions_and_applies_scope_policy() {
 
     for invalid in [
         format!(
-            "/oidc/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&scope=admin"
+            "/relay/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&scope=admin"
         ),
         format!(
-            "/oidc/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&request=opaque"
+            "/relay/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&request=opaque"
         ),
         format!(
-            "/oidc/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&response_mode=form_post"
+            "/relay/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&response_mode=form_post"
         ),
         format!(
-            "/oidc/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&nonce=one&nonce=two"
+            "/relay/relay/authorize?redirect_uri=https%3A%2F%2Fapp.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256&nonce=one&nonce=two"
         ),
     ] {
         let response = app
@@ -934,7 +935,7 @@ async fn run_signed_relay_profile(profile: RelayProfile) {
     let (app, fixture, task, redirect_uri, client_auth) = setup_signed_profile(profile).await;
     let nonce = "relying-party-nonce";
     let verifier = "profile-verifier-with-at-least-forty-three-characters";
-    let mut authorize = Url::parse("https://mux.example/oidc/profile/authorize").unwrap();
+    let mut authorize = Url::parse("https://mux.example/relay/profile/authorize").unwrap();
     authorize
         .query_pairs_mut()
         .append_pair("client_id", "upstream-client")
@@ -1113,7 +1114,7 @@ async fn discovery_preserves_upstream_trust_and_rewrites_relay_endpoints() {
     let response = app
         .clone()
         .oneshot(
-            Request::get("/oidc/google/.well-known/openid-configuration")
+            Request::get("/relay/google/.well-known/openid-configuration")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1125,17 +1126,17 @@ async fn discovery_preserves_upstream_trust_and_rewrites_relay_endpoints() {
     assert!(issuer.starts_with("http://127.0.0.1:"));
     assert_eq!(
         value["authorization_endpoint"],
-        "https://mux.example/oidc/google/authorize"
+        "https://mux.example/relay/google/authorize"
     );
     assert_eq!(
         value["token_endpoint"],
-        "https://mux.example/oidc/google/token"
+        "https://mux.example/relay/google/token"
     );
     assert_eq!(value["jwks_uri"], format!("{issuer}jwks"));
     assert_eq!(value["custom_field"], "preserved");
     let jwks = app
         .oneshot(
-            Request::get("/oidc/google/jwks")
+            Request::get("/relay/google/jwks")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1157,7 +1158,7 @@ async fn explicit_endpoints_produce_transparent_relay_metadata() {
     .await;
     let response = app
         .oneshot(
-            Request::get("/oidc/google/.well-known/openid-configuration")
+            Request::get("/relay/google/.well-known/openid-configuration")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -1169,11 +1170,11 @@ async fn explicit_endpoints_produce_transparent_relay_metadata() {
     assert!(issuer.starts_with("http://127.0.0.1:"));
     assert_eq!(
         value["authorization_endpoint"],
-        "https://mux.example/oidc/google/authorize"
+        "https://mux.example/relay/google/authorize"
     );
     assert_eq!(
         value["token_endpoint"],
-        "https://mux.example/oidc/google/token"
+        "https://mux.example/relay/google/token"
     );
     assert_eq!(value["jwks_uri"], format!("{issuer}/jwks"));
     task.abort();
@@ -1185,7 +1186,7 @@ async fn token_preflight_reflects_only_an_allowed_origin() {
     let allowed = app
         .clone()
         .oneshot(
-            Request::options("/oidc/google/token")
+            Request::options("/relay/google/token")
                 .header(header::ORIGIN, "https://app.example")
                 .body(Body::empty())
                 .unwrap(),
@@ -1199,7 +1200,7 @@ async fn token_preflight_reflects_only_an_allowed_origin() {
     );
     let denied = app
         .oneshot(
-            Request::options("/oidc/google/token")
+            Request::options("/relay/google/token")
                 .header(header::ORIGIN, "https://evil.example")
                 .body(Body::empty())
                 .unwrap(),
@@ -1259,7 +1260,7 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
     let claims = json!({
         "iss": "jwt-application",
         "sub": "jwt-application",
-        "aud": "https://mux.example/oidc/jwt/token",
+        "aud": "https://mux.example/relay/jwt/token",
         "exp": unix_now() + 60,
         "iat": unix_now(),
         "jti": "unique-assertion"

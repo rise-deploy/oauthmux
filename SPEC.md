@@ -72,16 +72,16 @@ upstream rejects the candidate snapshot.
 
 ## HTTP routes
 
-For relay key `R` and upstream key `U`:
+For public base URL `B`, relay key `R`, and upstream key `U`:
 
 | Route | Behavior |
 | --- | --- |
-| `GET /oidc/{R}/authorize` | Validates redirect and downstream PKCE, applies relay scope policy, creates independent upstream state and PKCE, and redirects to the referenced upstream. |
-| `GET /oidc/upstreams/{U}/callback` | Unseals upstream-bound state, resolves the originating relay, exchanges the upstream code, and returns to the relay's validated application redirect. |
-| `POST /oidc/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged. |
-| `POST /oidc/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. |
-| `GET /oidc/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
-| `GET /oidc/{R}/jwks` | Proxies the referenced upstream JWKS. |
+| `GET {B}/relay/{R}/authorize` | Validates redirect and downstream PKCE, applies relay scope policy, creates independent upstream state and PKCE, and redirects to the referenced upstream. |
+| `GET {B}/upstream/{U}/callback` | Unseals upstream-bound state, resolves the originating relay, exchanges the upstream code, and returns to the relay's validated application redirect. |
+| `POST {B}/relay/{R}/token` | Authenticates the downstream client, validates the sealed code, redirect and PKCE, then returns the stored upstream response unchanged. |
+| `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the downstream client and relays the refresh grant using the upstream client credentials. |
+| `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
+| `GET {B}/relay/{R}/jwks` | Proxies the referenced upstream JWKS. |
 | `GET /healthz` | Standalone runtime liveness. |
 | `GET /readyz` | Ready after every configured provider supplies its first snapshot. |
 
@@ -232,7 +232,7 @@ valid graph.
 ## Runtime
 
 ```text
-OAUTHMUX_PUBLIC_URL=https://auth.example.com
+OAUTHMUX_PUBLIC_URL=https://auth.example.com/oidc
 OAUTHMUX_SEAL_KEY=base64:…
 OAUTHMUX_SEAL_KEY_PREVIOUS=base64:…
 OAUTHMUX_LISTEN=0.0.0.0:8080

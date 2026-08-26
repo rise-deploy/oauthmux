@@ -77,7 +77,7 @@ Generate a 32-byte sealing key and start the server:
 
 ```console
 export EXAMPLE_CLIENT_SECRET='provider-client-secret'
-export OAUTHMUX_PUBLIC_URL='https://login.example.com'
+export OAUTHMUX_PUBLIC_URL='https://login.example.com/oidc'
 export OAUTHMUX_SEAL_KEY="base64:$(openssl rand -base64 32)"
 export OAUTHMUX_PROVIDER_FILE="$PWD/config.yaml"
 cargo run -p oauthmux
@@ -91,15 +91,15 @@ The native server listens on `0.0.0.0:8080` by default. `/healthz` reports proce
 Register this callback with the external provider:
 
 ```text
-https://login.example.com/oidc/upstreams/example/callback
+https://login.example.com/oidc/upstream/example/callback
 ```
 
 Configure the relying party with the upstream issuer, JWKS, and UserInfo endpoints. Route only its
 authorization and token requests through the relay:
 
 ```text
-https://login.example.com/oidc/example/authorize
-https://login.example.com/oidc/example/token
+https://login.example.com/oidc/relay/example/authorize
+https://login.example.com/oidc/relay/example/token
 ```
 
 This separation is the defining constraint of [transparent relay mode](/oauthmux/modes/). A client

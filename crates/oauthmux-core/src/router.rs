@@ -126,15 +126,14 @@ enum Endpoint {
 }
 
 pub fn router(resolver: Arc<dyn ResourceResolver>, cfg: MuxConfig, keys: KeyStrategy) -> Router {
+    let route = public_route_pattern(&cfg.public_url);
     let state = AppState {
         resolver,
         cfg: Arc::new(cfg),
         keys,
         cache: Arc::new(Mutex::new(HashMap::new())),
     };
-    Router::new()
-        .route("/oidc/{*path}", any(dispatch))
-        .with_state(state)
+    Router::new().route(&route, any(dispatch)).with_state(state)
 }
 
 async fn dispatch(
@@ -232,26 +231,27 @@ async fn dispatch(
 
 fn parse_path(path: &str, strategy: &KeyStrategy) -> Option<(ResourceKey, Endpoint)> {
     let segments: Vec<_> = path.trim_matches('/').split('/').collect();
-    let (key_parts, endpoint) =
-        if segments.first() == Some(&"upstreams") && segments.last() == Some(&"callback") {
-            (
-                &segments[1..segments.len().checked_sub(1)?],
-                Endpoint::Callback,
-            )
-        } else if segments.ends_with(&[".well-known", "openid-configuration"]) {
-            (
-                &segments[..segments.len().checked_sub(2)?],
-                Endpoint::Discovery,
-            )
-        } else {
-            let endpoint = match *segments.last()? {
+    let (namespace, namespaced) = segments.split_first()?;
+    let (key_parts, endpoint) = match *namespace {
+        "upstream" if namespaced.last() == Some(&"callback") => (
+            &namespaced[..namespaced.len().checked_sub(1)?],
+            Endpoint::Callback,
+        ),
+        "relay" if namespaced.ends_with(&[".well-known", "openid-configuration"]) => (
+            &namespaced[..namespaced.len().checked_sub(2)?],
+            Endpoint::Discovery,
+        ),
+        "relay" => {
+            let endpoint = match *namespaced.last()? {
                 "authorize" => Endpoint::Authorize,
                 "token" => Endpoint::Token,
                 "jwks" => Endpoint::Jwks,
                 _ => return None,
             };
-            (&segments[..segments.len().checked_sub(1)?], endpoint)
-        };
+            (&namespaced[..namespaced.len().checked_sub(1)?], endpoint)
+        }
+        _ => return None,
+    };
     let key = match strategy {
         KeyStrategy::SingleSegment if key_parts.len() == 1 => ResourceKey::new(key_parts[0]).ok(),
         KeyStrategy::TwoSegment if key_parts.len() == 2 => {
@@ -1124,7 +1124,7 @@ fn unseal_postcard<T: for<'de> Deserialize<'de>>(
 fn relay_base_url(public_url: &Url, key: &ResourceKey) -> Url {
     let mut url = public_url.clone();
     url.set_path(&format!(
-        "{}/oidc/{}/",
+        "{}/relay/{}/",
         public_url.path().trim_end_matches('/'),
         key
     ));
@@ -1136,13 +1136,17 @@ fn relay_base_url(public_url: &Url, key: &ResourceKey) -> Url {
 fn callback_url(public_url: &Url, key: &ResourceKey) -> Url {
     let mut url = public_url.clone();
     url.set_path(&format!(
-        "{}/oidc/upstreams/{}/callback",
+        "{}/upstream/{}/callback",
         public_url.path().trim_end_matches('/'),
         key
     ));
     url.set_query(None);
     url.set_fragment(None);
     url
+}
+
+fn public_route_pattern(public_url: &Url) -> String {
+    format!("{}/{{*path}}", public_url.path().trim_end_matches('/'))
 }
 
 fn token_url(public_url: &Url, key: &ResourceKey) -> Url {
@@ -1219,13 +1223,15 @@ mod tests {
 
     #[test]
     fn path_strategies_are_exact() {
-        assert!(parse_path("google/token", &KeyStrategy::SingleSegment).is_some());
+        assert!(parse_path("relay/google/token", &KeyStrategy::SingleSegment).is_some());
         assert!(parse_path(
-            "project/ext/.well-known/openid-configuration",
+            "relay/project/ext/.well-known/openid-configuration",
             &KeyStrategy::TwoSegment
         )
         .is_some());
-        assert!(parse_path("project/ext/token", &KeyStrategy::SingleSegment).is_none());
+        assert!(parse_path("relay/project/ext/token", &KeyStrategy::SingleSegment).is_none());
+        assert!(parse_path("upstream/google/callback", &KeyStrategy::SingleSegment).is_some());
+        assert!(parse_path("relay/google/callback", &KeyStrategy::SingleSegment).is_none());
     }
 
     #[test]

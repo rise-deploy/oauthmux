@@ -10,7 +10,8 @@ import Mermaid from '../../../components/Mermaid.astro';
 This layout lets one Google OAuth client serve many Amazon Cognito user pools through one stable
 oauthmux callback. Each pool talks to the same relay for authorization and token exchange. That
 relay references the shared Google upstream, while Cognito validates Google's ID token and obtains
-claims from Google's UserInfo endpoint.
+claims from Google's UserInfo endpoint. The URLs below use
+`OAUTHMUX_PUBLIC_URL=https://login.example.com/oidc`.
 
 <Mermaid
   label="Multiple Cognito user pools use one relay backed by one Google upstream and one stable callback registered with Google."
@@ -34,7 +35,7 @@ Google sees one OAuth client and one allowed redirect URL regardless of how many
 it:
 
 ```text
-https://login.example.com/oidc/upstreams/google/callback
+https://login.example.com/oidc/upstream/google/callback
 ```
 
 oauthmux remembers which validated Cognito `/oauth2/idpresponse` URL started each flow and returns
@@ -57,7 +58,7 @@ Create a web OAuth client in the Google project. Register exactly the stable cal
 shared upstream:
 
 ```text
-https://login.example.com/oidc/upstreams/google/callback
+https://login.example.com/oidc/upstream/google/callback
 ```
 
 The client needs the OpenID Connect scopes Cognito will request, normally `openid`, `email`, and
@@ -145,8 +146,8 @@ route only the authorization and token fields through the `cognito-google` relay
     "client_secret": "<Google OAuth client secret>",
     "authorize_scopes": "openid email profile",
     "oidc_issuer": "https://accounts.google.com",
-    "authorize_url": "https://login.example.com/oidc/cognito-google/authorize",
-    "token_url": "https://login.example.com/oidc/cognito-google/token",
+    "authorize_url": "https://login.example.com/oidc/relay/cognito-google/authorize",
+    "token_url": "https://login.example.com/oidc/relay/cognito-google/token",
     "attributes_url": "https://openidconnect.googleapis.com/v1/userinfo",
     "attributes_request_method": "GET",
     "jwks_uri": "https://www.googleapis.com/oauth2/v3/certs"

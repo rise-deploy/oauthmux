@@ -67,12 +67,15 @@ An upstream and a relay may use the same name because identities include the res
 | `spec.oauthClient.clientId` | yes | Provider OAuth client ID. |
 | `spec.oauthClient.clientSecret` | yes | Provider OAuth client secret as a [secret value](#secret-values). |
 
-The callback registered with the provider is derived from `OAUTHMUX_PUBLIC_URL` and the upstream
-name:
+`OAUTHMUX_PUBLIC_URL` is the complete externally visible OAuth API base. The callback registered
+with the provider is derived from that base and the upstream name:
 
 ```text
-https://login.example.com/oidc/upstreams/google/callback
+https://login.example.com/oidc/upstream/google/callback
 ```
+
+Here `OAUTHMUX_PUBLIC_URL` is `https://login.example.com/oidc`. Set it to another path, such as
+`https://login.example.com/services/oauthmux`, to serve the same API under that path instead.
 
 Explicit endpoints are useful for providers without standard discovery. When authorization or
 token is omitted, oauthmux reads `{issuerUrl}/.well-known/openid-configuration`. The issuer and
@@ -91,8 +94,8 @@ JWKS remain upstream-owned in transparent relay mode.
 Relay endpoints are derived from the relay name:
 
 ```text
-https://login.example.com/oidc/cognito-google/authorize
-https://login.example.com/oidc/cognito-google/token
+https://login.example.com/oidc/relay/cognito-google/authorize
+https://login.example.com/oidc/relay/cognito-google/token
 ```
 
 Every authorization request supplies `redirect_uri`. Policy entries are ORed and each entry

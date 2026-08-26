@@ -21,10 +21,7 @@ export default defineConfig({
       ],
       sidebar: [
         { label: 'Home', slug: 'index' },
-        {
-          label: 'Start here',
-          items: [{ label: 'Getting started', slug: 'getting-started' }],
-        },
+        { label: 'Getting started', slug: 'getting-started' },
         {
           label: 'Concepts',
           items: [{ label: 'Operating modes', slug: 'modes' }],

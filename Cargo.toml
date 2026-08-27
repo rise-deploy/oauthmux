@@ -1,10 +1,10 @@
 [workspace]
 members = [
-  "crates/oauthmux-core",
-  "crates/oauthmux-secret-resolver",
-  "crates/oauthmux-provider-file",
-  "crates/oauthmux-provider-ssm",
-  "crates/oauthmux",
+  "crates/oauthrelay-core",
+  "crates/oauthrelay-secret-resolver",
+  "crates/oauthrelay-provider-file",
+  "crates/oauthrelay-provider-ssm",
+  "crates/oauthrelay",
 ]
 resolver = "2"
 
@@ -12,7 +12,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/rise-deploy/oauthmux"
+repository = "https://github.com/rise-deploy/oauthrelay"
 rust-version = "1.85"
 
 [workspace.dependencies]

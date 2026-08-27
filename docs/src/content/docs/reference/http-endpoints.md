@@ -1,10 +1,10 @@
 ---
 title: HTTP endpoints
-description: Reference for oauthmux relay, callback, metadata, and health routes.
+description: Reference for oauthrelay relay, callback, metadata, and health routes.
 ---
 
-`OAUTHMUX_PUBLIC_URL` is the complete base `B` for the OAuth API. For relay name `R` referencing
-upstream name `U`, oauthmux serves:
+`OAUTHRELAY_PUBLIC_URL` is the complete base `B` for the OAuth API. For relay name `R` referencing
+upstream name `U`, oauthrelay serves:
 
 | Method and route | Behavior |
 | --- | --- |
@@ -20,7 +20,7 @@ upstream name `U`, oauthmux serves:
 
 ## Authorization endpoint
 
-Only authorization-code flow and query response mode are accepted. oauthmux owns and replaces
+Only authorization-code flow and query response mode are accepted. oauthrelay owns and replaces
 `client_id`, `redirect_uri`, `state`, upstream PKCE, and `response_type`. Other parameters,
 including `nonce`, `prompt`, `login_hint`, `access_type`, `hd`, repeated `resource` values, and
 provider extensions, are forwarded.
@@ -30,7 +30,7 @@ be reconciled safely with proxy-owned values. A supplied scope must pass the rel
 public relay also requires a valid S256 application code challenge.
 
 `redirect_uri` is required and must match one configured redirect-policy entry. Static query
-parameters are part of the match. oauthmux appends authorization results and application state
+parameters are part of the match. oauthrelay appends authorization results and application state
 only after the redirect has passed policy.
 
 ## Callback
@@ -39,7 +39,7 @@ The callback is owned by the upstream, not by an individual relay. Sealed state 
 originating relay and validated application redirect, so several relays can share the same
 upstream callback. Upstream error parameters are returned only to that validated redirect.
 
-oauthmux exchanges a successful upstream code immediately. It stores the upstream status, content
+oauthrelay exchanges a successful upstream code immediately. It stores the upstream status, content
 type, and body inside the sealed application code and never exposes the upstream code to the
 application.
 
@@ -56,6 +56,6 @@ bodies.
 ## Transparent metadata
 
 Relay metadata is useful to inspect the routed authorization and token endpoints, but is not a
-portable OIDC Discovery contract. The metadata URL is hosted by oauthmux while `issuer` remains the
+portable OIDC Discovery contract. The metadata URL is hosted by oauthrelay while `issuer` remains the
 upstream issuer. Configure transparent-relay relying parties with manual endpoints as described in
-[Operating modes](/oauthmux/modes/).
+[Relay trust model](/oauthrelay/relay-model/).

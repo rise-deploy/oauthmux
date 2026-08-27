@@ -40,17 +40,17 @@ export function namesForRun(runId) {
   if (!/^[a-z0-9][a-z0-9-]{2,31}$/.test(runId)) {
     throw new Error('run ID must contain 3-32 lowercase letters, numbers, or hyphens');
   }
-  const base = `oauthmux-e2e-${runId}`;
+  const base = `oauthrelay-e2e-${runId}`;
   return {
     runId,
     functionName: base,
     roleName: base,
-    rolePolicyName: 'oauthmux-e2e',
-    repositoryName: `oauthmux-e2e/${runId}`,
-    secretName: `oauthmux-e2e/${runId}/google-client`,
-    ssmPrefix: `/oauthmux-e2e/${runId}/`,
-    upstreamParameter: `/oauthmux-e2e/${runId}/upstreams/google`,
-    relayParameter: `/oauthmux-e2e/${runId}/relays/google`,
+    rolePolicyName: 'oauthrelay-e2e',
+    repositoryName: `oauthrelay-e2e/${runId}`,
+    secretName: `oauthrelay-e2e/${runId}/google-client`,
+    ssmPrefix: `/oauthrelay-e2e/${runId}/`,
+    upstreamParameter: `/oauthrelay-e2e/${runId}/upstreams/google`,
+    relayParameter: `/oauthrelay-e2e/${runId}/relays/google`,
     logGroup: `/aws/lambda/${base}`,
   };
 }
@@ -58,7 +58,7 @@ export function namesForRun(runId) {
 export function resourceDocuments(secretArn, clientId) {
   return {
     upstream: {
-      apiVersion: 'oauthmux.dev/v1alpha1',
+      apiVersion: 'oauthrelay.dev/v1alpha1',
       kind: 'Upstream',
       metadata: { name: 'google' },
       spec: {
@@ -74,7 +74,7 @@ export function resourceDocuments(secretArn, clientId) {
       },
     },
     relay: {
-      apiVersion: 'oauthmux.dev/v1alpha1',
+      apiVersion: 'oauthrelay.dev/v1alpha1',
       kind: 'Relay',
       metadata: { name: 'google' },
       spec: {
@@ -406,7 +406,7 @@ export async function deploy({ options, image, clientId, secret, aws, names, acc
     'ecr', 'create-repository', '--repository-name', names.repositoryName,
     '--image-tag-mutability', 'IMMUTABLE',
     '--image-scanning-configuration', 'scanOnPush=true',
-    '--tags', `Key=Purpose,Value=oauthmux-e2e`, `Key=RunId,Value=${names.runId}`,
+    '--tags', `Key=Purpose,Value=oauthrelay-e2e`, `Key=RunId,Value=${names.runId}`,
   ), 'create-repository').repository;
   const repositoryUri = repository.repositoryUri;
 
@@ -450,9 +450,9 @@ export async function deploy({ options, image, clientId, secret, aws, names, acc
   status('Creating the run-scoped Google client secret...');
   const secretArn = parseJson(await aws(
     'secretsmanager', 'create-secret', '--name', names.secretName,
-    '--description', `oauthmux Google relay test ${names.runId}`,
+    '--description', `oauthrelay Google relay test ${names.runId}`,
     '--secret-string', `file://${secretPath}`,
-    '--tags', `Key=Purpose,Value=oauthmux-e2e`, `Key=RunId,Value=${names.runId}`,
+    '--tags', `Key=Purpose,Value=oauthrelay-e2e`, `Key=RunId,Value=${names.runId}`,
   ), 'create-secret').ARN;
 
   const documents = resourceDocuments(secretArn, clientId);
@@ -461,11 +461,11 @@ export async function deploy({ options, image, clientId, secret, aws, names, acc
   status(`Creating SSM resources below ${names.ssmPrefix}...`);
   await aws(
     'ssm', 'put-parameter', '--name', names.upstreamParameter, '--type', 'String',
-    '--value', `file://${upstreamPath}`, '--tags', `Key=Purpose,Value=oauthmux-e2e`, `Key=RunId,Value=${names.runId}`,
+    '--value', `file://${upstreamPath}`, '--tags', `Key=Purpose,Value=oauthrelay-e2e`, `Key=RunId,Value=${names.runId}`,
   );
   await aws(
     'ssm', 'put-parameter', '--name', names.relayParameter, '--type', 'String',
-    '--value', `file://${relayPath}`, '--tags', `Key=Purpose,Value=oauthmux-e2e`, `Key=RunId,Value=${names.runId}`,
+    '--value', `file://${relayPath}`, '--tags', `Key=Purpose,Value=oauthrelay-e2e`, `Key=RunId,Value=${names.runId}`,
   );
 
   const trustPath = await writeJson(join(workdir, 'trust-policy.json'), {
@@ -480,8 +480,8 @@ export async function deploy({ options, image, clientId, secret, aws, names, acc
   const role = parseJson(await aws(
     'iam', 'create-role', '--role-name', names.roleName,
     '--assume-role-policy-document', `file://${trustPath}`,
-    '--description', `oauthmux Google relay test ${names.runId}`,
-    '--tags', `Key=Purpose,Value=oauthmux-e2e`, `Key=RunId,Value=${names.runId}`,
+    '--description', `oauthrelay Google relay test ${names.runId}`,
+    '--tags', `Key=Purpose,Value=oauthrelay-e2e`, `Key=RunId,Value=${names.runId}`,
   ), 'create-role').Role;
   const rolePolicyPath = await writeJson(join(workdir, 'role-policy.json'), executionRolePolicy({
     partition: account.partition,
@@ -498,11 +498,11 @@ export async function deploy({ options, image, clientId, secret, aws, names, acc
   const sealKey = `base64:${randomBytes(32).toString('base64')}`;
   const environmentPath = join(workdir, 'lambda-environment.json');
   const environment = (publicUrl) => ({ Variables: {
-    OAUTHMUX_PUBLIC_URL: publicUrl,
-    OAUTHMUX_PROVIDER_SSM_PREFIX: names.ssmPrefix,
-    OAUTHMUX_LAMBDA_CONFIG_TTL: '60s',
-    OAUTHMUX_SEAL_KEY: sealKey,
-    OAUTHMUX_LOG: 'info',
+    OAUTHRELAY_PUBLIC_URL: publicUrl,
+    OAUTHRELAY_PROVIDER_SSM_PREFIX: names.ssmPrefix,
+    OAUTHRELAY_LAMBDA_CONFIG_TTL: '60s',
+    OAUTHRELAY_SEAL_KEY: sealKey,
+    OAUTHRELAY_LOG: 'info',
   } });
   await writeJson(environmentPath, environment('https://example.invalid/oidc'));
   const lambdaArchitecture = image.architecture === 'amd64' ? 'x86_64' : 'arm64';
@@ -510,12 +510,12 @@ export async function deploy({ options, image, clientId, secret, aws, names, acc
   await retry(
     () => aws(
       'lambda', 'create-function', '--function-name', names.functionName,
-      '--description', `oauthmux Google relay test ${names.runId}`,
+      '--description', `oauthrelay Google relay test ${names.runId}`,
       '--package-type', 'Image', '--code', `ImageUri=${destination}`,
       '--role', role.Arn, '--architectures', lambdaArchitecture,
       '--timeout', '30', '--memory-size', '256',
       '--environment', `file://${environmentPath}`,
-      '--tags', `Purpose=oauthmux-e2e,RunId=${names.runId}`,
+      '--tags', `Purpose=oauthrelay-e2e,RunId=${names.runId}`,
     ),
     { retryIf: (error) => /cannot be assumed|InvalidParameterValue/i.test(error.message) },
   );
@@ -574,7 +574,7 @@ function startCallbackServer(timeoutMs = DEFAULT_CALLBACK_TIMEOUT_MS) {
       return;
     }
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-    response.end('<!doctype html><title>oauthmux verified</title><p>Authorization returned to the oauthmux verification script. You may close this window.</p>');
+    response.end('<!doctype html><title>oauthrelay verified</title><p>Authorization returned to the oauthrelay verification script. You may close this window.</p>');
     settle.resolve(url);
   });
   server.on('error', (error) => settle.reject(error));
@@ -646,7 +646,7 @@ async function verifyGoogleIdToken(idToken, { clientId, nonce, metadata }) {
 }
 
 async function verifyRelay({ publicUrl, clientId, noOpen, status }) {
-  status('Waiting for oauthmux readiness...');
+  status('Waiting for oauthrelay readiness...');
   await fetchWithRetry(`${new URL(publicUrl).origin}/readyz`);
 
   const upstreamMetadataResponse = await fetchWithRetry(
@@ -700,7 +700,7 @@ async function verifyRelay({ publicUrl, clientId, noOpen, status }) {
     throw new Error(`authorization failed: ${callback.searchParams.get('error')}`);
   }
   if (!sameText(callback.searchParams.get('state') ?? '', state)) {
-    throw new Error('application state did not round-trip through oauthmux');
+    throw new Error('application state did not round-trip through oauthrelay');
   }
   const code = callback.searchParams.get('code');
   if (!code) throw new Error('application callback did not contain an authorization code');
@@ -735,7 +735,7 @@ async function verifyRelay({ publicUrl, clientId, noOpen, status }) {
 
 async function defaultImage(runner) {
   const revision = (await runner('git', ['rev-parse', '--short=7', 'HEAD'])).stdout;
-  return { image: `ghcr.io/rise-deploy/oauthmux:sha-${revision}`, revision };
+  return { image: `ghcr.io/rise-deploy/oauthrelay:sha-${revision}`, revision };
 }
 
 async function accountContext(aws) {
@@ -792,7 +792,7 @@ async function main(argv = process.argv.slice(2), runner = runProcess) {
 
   const account = await accountContext(aws);
   const names = namesForRun(runIdNow());
-  const workdir = await mkdtemp(join(tmpdir(), 'oauthmux-e2e-'));
+  const workdir = await mkdtemp(join(tmpdir(), 'oauthrelay-e2e-'));
   await chmod(workdir, 0o700);
   let deployed;
   let cleaning = false;

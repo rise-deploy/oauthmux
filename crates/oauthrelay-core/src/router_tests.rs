@@ -307,8 +307,8 @@ async fn setup_signed_profile(
     resources.relays.insert(key, relay);
     let app = router(
         Arc::new(resources),
-        MuxConfig {
-            public_url: Url::parse("https://mux.example/").unwrap(),
+        RelayConfig {
+            public_url: Url::parse("https://relay.example/").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[8_u8; 32], None).unwrap()),
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::new(),
@@ -386,8 +386,8 @@ async fn setup_with_capture(
     let sealer = Arc::new(XChaChaSealer::new(&[7_u8; 32], None).unwrap());
     let app = router(
         Arc::new(resources),
-        MuxConfig {
-            public_url: Url::parse("https://mux.example/").unwrap(),
+        RelayConfig {
+            public_url: Url::parse("https://relay.example/").unwrap(),
             sealer: sealer.clone(),
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::new(),
@@ -440,8 +440,8 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
     }
     let app = router(
         Arc::new(resources),
-        MuxConfig {
-            public_url: Url::parse("https://mux.example/custom/base").unwrap(),
+        RelayConfig {
+            public_url: Url::parse("https://relay.example/custom/base").unwrap(),
             sealer: Arc::new(XChaChaSealer::new(&[9_u8; 32], None).unwrap()),
             replay_cache: None,
             http: reqwest::Client::new(),
@@ -471,7 +471,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
                 .find(|(name, _)| name == "redirect_uri")
                 .unwrap()
                 .1,
-            "https://mux.example/custom/base/upstream/google/callback"
+            "https://relay.example/custom/base/upstream/google/callback"
         );
     }
 }
@@ -935,7 +935,7 @@ async fn run_signed_relay_profile(profile: RelayProfile) {
     let (app, fixture, task, redirect_uri, client_auth) = setup_signed_profile(profile).await;
     let nonce = "relying-party-nonce";
     let verifier = "profile-verifier-with-at-least-forty-three-characters";
-    let mut authorize = Url::parse("https://mux.example/relay/profile/authorize").unwrap();
+    let mut authorize = Url::parse("https://relay.example/relay/profile/authorize").unwrap();
     authorize
         .query_pairs_mut()
         .append_pair("client_id", "upstream-client")
@@ -954,7 +954,7 @@ async fn run_signed_relay_profile(profile: RelayProfile) {
             .append_pair("login_hint", "person@example.com")
             .append_pair("hd", "example.com");
     }
-    let mux_authorize = app
+    let relay_authorize = app
         .clone()
         .oneshot(
             Request::get(format!(
@@ -967,18 +967,22 @@ async fn run_signed_relay_profile(profile: RelayProfile) {
         )
         .await
         .unwrap();
-    assert_eq!(mux_authorize.status(), StatusCode::FOUND);
+    assert_eq!(relay_authorize.status(), StatusCode::FOUND);
     let upstream = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap()
-        .get(mux_authorize.headers()[header::LOCATION].to_str().unwrap())
+        .get(
+            relay_authorize.headers()[header::LOCATION]
+                .to_str()
+                .unwrap(),
+        )
         .send()
         .await
         .unwrap();
     assert_eq!(upstream.status(), StatusCode::FOUND);
     let callback = Url::parse(upstream.headers()[header::LOCATION].to_str().unwrap()).unwrap();
-    let mux_callback = app
+    let relay_callback = app
         .clone()
         .oneshot(
             Request::get(format!("{}?{}", callback.path(), callback.query().unwrap()))
@@ -987,9 +991,9 @@ async fn run_signed_relay_profile(profile: RelayProfile) {
         )
         .await
         .unwrap();
-    assert_eq!(mux_callback.status(), StatusCode::FOUND);
+    assert_eq!(relay_callback.status(), StatusCode::FOUND);
     let application =
-        Url::parse(mux_callback.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+        Url::parse(relay_callback.headers()[header::LOCATION].to_str().unwrap()).unwrap();
     assert_eq!(
         application
             .query_pairs()
@@ -1126,11 +1130,11 @@ async fn discovery_preserves_upstream_trust_and_rewrites_relay_endpoints() {
     assert!(issuer.starts_with("http://127.0.0.1:"));
     assert_eq!(
         value["authorization_endpoint"],
-        "https://mux.example/relay/google/authorize"
+        "https://relay.example/relay/google/authorize"
     );
     assert_eq!(
         value["token_endpoint"],
-        "https://mux.example/relay/google/token"
+        "https://relay.example/relay/google/token"
     );
     assert_eq!(value["jwks_uri"], format!("{issuer}jwks"));
     assert_eq!(value["custom_field"], "preserved");
@@ -1170,11 +1174,11 @@ async fn explicit_endpoints_produce_transparent_relay_metadata() {
     assert!(issuer.starts_with("http://127.0.0.1:"));
     assert_eq!(
         value["authorization_endpoint"],
-        "https://mux.example/relay/google/authorize"
+        "https://relay.example/relay/google/authorize"
     );
     assert_eq!(
         value["token_endpoint"],
-        "https://mux.example/relay/google/token"
+        "https://relay.example/relay/google/token"
     );
     assert_eq!(value["jwks_uri"], format!("{issuer}/jwks"));
     task.abort();
@@ -1260,7 +1264,7 @@ async fn private_key_jwt_authenticates_a_signed_assertion() {
     let claims = json!({
         "iss": "jwt-application",
         "sub": "jwt-application",
-        "aud": "https://mux.example/relay/jwt/token",
+        "aud": "https://relay.example/relay/jwt/token",
         "exp": unix_now() + 60,
         "iat": unix_now(),
         "jti": "unique-assertion"

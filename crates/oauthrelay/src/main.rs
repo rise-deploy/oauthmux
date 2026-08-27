@@ -9,15 +9,15 @@ use axum::{
 };
 use axum::{http::StatusCode, routing::get, Router};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use oauthmux_core::{
-    resource_schema, router, ConfigProvider, KeyStrategy, MemoryReplayCache, MuxConfig,
-    ProviderSnapshot, Registry, XChaChaSealer,
+use oauthrelay_core::{
+    resource_schema, router, ConfigProvider, KeyStrategy, MemoryReplayCache, ProviderSnapshot,
+    Registry, RelayConfig, XChaChaSealer,
 };
 #[cfg(feature = "aws")]
-use oauthmux_core::{SecretResolver, SecretSource, SecretString};
-use oauthmux_provider_file::FileProvider;
+use oauthrelay_core::{SecretResolver, SecretSource, SecretString};
+use oauthrelay_provider_file::FileProvider;
 #[cfg(feature = "aws")]
-use oauthmux_provider_ssm::{
+use oauthrelay_provider_ssm::{
     AwsSecretResolver, AwsSecretsManagerClient, AwsSsmClient, SsmProvider,
 };
 #[cfg(feature = "lambda")]
@@ -108,14 +108,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     init_tracing();
-    let public_url = required_url("OAUTHMUX_PUBLIC_URL")?;
-    let current = seal_key("OAUTHMUX_SEAL_KEY", true)?.expect("required key");
-    let previous = seal_key("OAUTHMUX_SEAL_KEY_PREVIOUS", false)?;
+    let public_url = required_url("OAUTHRELAY_PUBLIC_URL")?;
+    let current = seal_key("OAUTHRELAY_SEAL_KEY", true)?.expect("required key");
+    let previous = seal_key("OAUTHRELAY_SEAL_KEY_PREVIOUS", false)?;
     let sealer = Arc::new(XChaChaSealer::new(&current, previous.as_deref())?);
     let providers = configured_providers().await?;
     if providers.is_empty() {
         return Err(anyhow!(
-            "at least one provider is required; set OAUTHMUX_PROVIDER_FILE or OAUTHMUX_PROVIDER_SSM_PREFIX"
+            "at least one provider is required; set OAUTHRELAY_PROVIDER_FILE or OAUTHRELAY_PROVIDER_SSM_PREFIX"
         ));
     }
     let registry = Arc::new(Registry::default());
@@ -123,14 +123,14 @@ async fn main() -> anyhow::Result<()> {
     await_initial_snapshots(&mut running).await?;
     replace_registry(&registry, &running);
 
-    let mux = router(
+    let relay_router = router(
         registry.clone(),
-        MuxConfig {
+        RelayConfig {
             public_url,
             sealer,
             replay_cache: Some(Arc::new(MemoryReplayCache::default())),
             http: reqwest::Client::builder().build()?,
-            allow_localhost_loopback: bool_env("OAUTHMUX_ALLOW_LOCALHOST_LOOPBACK", false)?,
+            allow_localhost_loopback: bool_env("OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK", false)?,
         },
         KeyStrategy::SingleSegment,
     );
@@ -150,14 +150,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }),
         )
-        .merge(mux);
+        .merge(relay_router);
 
     if is_lambda_runtime() {
         #[cfg(feature = "lambda")]
         {
             // Lambda refreshes providers at invocation boundaries because it freezes between requests.
             let refresh_ttl =
-                duration_env("OAUTHMUX_LAMBDA_CONFIG_TTL", DEFAULT_LAMBDA_CONFIG_TTL)?;
+                duration_env("OAUTHRELAY_LAMBDA_CONFIG_TTL", DEFAULT_LAMBDA_CONFIG_TTL)?;
             let refresher = Arc::new(LambdaConfigRefresher::new(registry, running, refresh_ttl));
             let app = app.layer(middleware::from_fn_with_state(
                 refresher,
@@ -174,11 +174,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let updater = spawn_registry_updater(registry, running);
-    let listen = env::var("OAUTHMUX_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let listen = env::var("OAUTHRELAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("bind {listen}"))?;
-    tracing::info!(%listen, "oauthmux ready");
+    tracing::info!(%listen, "oauthrelay ready");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -188,8 +188,8 @@ async fn main() -> anyhow::Result<()> {
 
 async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> {
     let mut providers: Vec<Arc<dyn ConfigProvider>> = Vec::new();
-    let file_path = env::var("OAUTHMUX_PROVIDER_FILE").ok();
-    let ssm_prefix = env::var("OAUTHMUX_PROVIDER_SSM_PREFIX").ok();
+    let file_path = env::var("OAUTHRELAY_PROVIDER_FILE").ok();
+    let ssm_prefix = env::var("OAUTHRELAY_PROVIDER_SSM_PREFIX").ok();
 
     #[cfg(feature = "aws")]
     let aws_clients = if ssm_prefix.is_some() {
@@ -207,7 +207,7 @@ async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> 
     if let Some(path) = file_path {
         let provider = FileProvider::new(
             path,
-            duration_env("OAUTHMUX_PROVIDER_FILE_POLL", Duration::from_secs(30))?,
+            duration_env("OAUTHRELAY_PROVIDER_FILE_POLL", Duration::from_secs(30))?,
         )?;
         #[cfg(feature = "aws")]
         let provider = provider.with_aws_secrets(Arc::new(LazyAwsSecretResolver::default()));
@@ -220,13 +220,13 @@ async fn configured_providers() -> anyhow::Result<Vec<Arc<dyn ConfigProvider>>> 
             ssm.clone(),
             secrets_manager.clone(),
             prefix,
-            duration_env("OAUTHMUX_PROVIDER_SSM_POLL", Duration::from_secs(60))?,
+            duration_env("OAUTHRELAY_PROVIDER_SSM_POLL", Duration::from_secs(60))?,
         )?));
     }
     #[cfg(not(feature = "aws"))]
     if ssm_prefix.is_some() {
         return Err(anyhow!(
-            "OAUTHMUX_PROVIDER_SSM_PREFIX requires the oauthmux aws feature"
+            "OAUTHRELAY_PROVIDER_SSM_PREFIX requires the oauthrelay aws feature"
         ));
     }
     Ok(providers)
@@ -450,7 +450,7 @@ fn is_lambda_runtime() -> bool {
 }
 
 fn init_tracing() {
-    let filter = env::var("OAUTHMUX_LOG").unwrap_or_else(|_| "info".into());
+    let filter = env::var("OAUTHRELAY_LOG").unwrap_or_else(|_| "info".into());
     let builder =
         tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::new(filter));
     if std::io::stdout().is_terminal() {
@@ -481,7 +481,9 @@ mod tests {
     #[cfg(feature = "lambda")]
     use async_trait::async_trait;
     #[cfg(feature = "lambda")]
-    use oauthmux_core::{ClientAuth, RedirectMatcher, Relay, ResourceKey, SecretString, Upstream};
+    use oauthrelay_core::{
+        ClientAuth, RedirectMatcher, Relay, ResourceKey, SecretString, Upstream,
+    };
 
     #[cfg(feature = "lambda")]
     use std::sync::atomic::AtomicUsize;

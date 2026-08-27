@@ -1,6 +1,6 @@
 ---
 title: File provider
-description: Load oauthmux resources from a YAML document stream.
+description: Load oauthrelay resources from a YAML document stream.
 ---
 
 The File provider reads a multi-document YAML stream from one path. It is suitable for native
@@ -11,8 +11,8 @@ document is stored.
 ## Enable the provider
 
 ```console
-export OAUTHMUX_PROVIDER_FILE=/etc/oauthmux/config.yaml
-export OAUTHMUX_PROVIDER_FILE_POLL=30s
+export OAUTHRELAY_PROVIDER_FILE=/etc/oauthrelay/config.yaml
+export OAUTHRELAY_PROVIDER_FILE_POLL=30s
 ```
 
 The poll interval must include a unit such as `s` or `m` and must be greater than zero. It defaults
@@ -22,8 +22,8 @@ to `30s`.
 
 Put every upstream and relay in the same YAML stream, separated by `---`:
 
-```yaml oauthmux-config
-apiVersion: oauthmux.dev/v1alpha1
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
   name: example
@@ -36,7 +36,7 @@ spec:
         file:
           path: ./secrets/provider-client-secret
 ---
-apiVersion: oauthmux.dev/v1alpha1
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
   name: example
@@ -82,14 +82,14 @@ clientSecret:
 clientSecret:
   valueFrom:
     awsSsmParameter:
-      name: /oauthmux/secrets/provider-client-secret
+      name: /oauthrelay/secrets/provider-client-secret
 ```
 
 ```yaml
 clientSecret:
   valueFrom:
     awsSecretsManager:
-      secretId: oauthmux/provider
+      secretId: oauthrelay/provider
       jsonKey: clientSecret
 ```
 
@@ -97,7 +97,7 @@ The File and SSM providers use the same standard resolver. The standalone binary
 feature supplies the AWS resolver and standard AWS SDK credential, region, and endpoint chain.
 Embeddings inject the resolver with
 `FileProvider::with_aws_secrets`. Without an AWS resolver, AWS references reject the candidate
-snapshot. The [AWS SSM provider reference](/oauthmux/reference/ssm-provider/) documents secret
+snapshot. The [AWS SSM provider reference](/oauthrelay/reference/ssm-provider/) documents secret
 validation and the relevant `GetParameter`, `GetSecretValue`, and KMS permissions; those
 requirements also apply when the resource document comes from a file.
 
@@ -111,4 +111,4 @@ snapshot.
 When both File and SSM providers are enabled, File has precedence for a resource with the same kind
 and name. Collisions are logged and do not combine individual fields.
 
-See [Configuration](/oauthmux/configuration/) for every resource field and validation rule.
+See [Configuration](/oauthrelay/configuration/) for every resource field and validation rule.

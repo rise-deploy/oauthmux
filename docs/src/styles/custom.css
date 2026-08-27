@@ -27,7 +27,7 @@
   --sl-color-black: #ffffff;
 }
 
-.oauthmux-diagram {
+.oauthrelay-diagram {
   margin: 1.5rem 0;
   overflow-x: auto;
   border: 1px solid var(--sl-color-gray-5);
@@ -38,14 +38,14 @@
   padding: 1.25rem;
 }
 
-.oauthmux-diagram .mermaid {
+.oauthrelay-diagram .mermaid {
   display: flex;
   justify-content: center;
   margin: 0;
   background: transparent;
 }
 
-.oauthmux-diagram svg {
+.oauthrelay-diagram svg {
   min-width: 38rem;
   max-width: 100%;
   height: auto;

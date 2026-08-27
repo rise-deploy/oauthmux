@@ -1,6 +1,6 @@
 ---
 title: AWS SSM provider
-description: Load oauthmux resources from SSM Parameter Store and resolve AWS-managed secrets.
+description: Load oauthrelay resources from SSM Parameter Store and resolve AWS-managed secrets.
 ---
 
 The AWS SSM provider discovers complete resource documents under fixed Parameter Store paths. It
@@ -10,8 +10,8 @@ uses the standard inline, environment, file, SSM `SecureString`, and Secrets Man
 ## Enable the provider
 
 ```console
-export OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/
-export OAUTHMUX_PROVIDER_SSM_POLL=60s
+export OAUTHRELAY_PROVIDER_SSM_PREFIX=/oauthrelay/
+export OAUTHRELAY_PROVIDER_SSM_POLL=60s
 ```
 
 The prefix must start and end with `/`. AWS region, credentials, and endpoint selection follow the
@@ -22,21 +22,19 @@ standard AWS SDK provider chain. The poll interval defaults to `60s`.
 The provider enumerates these subpaths independently:
 
 ```text
-/oauthmux/upstreams/{name}
-/oauthmux/relays/{name}
-/oauthmux/brokers/{name}
+/oauthrelay/upstreams/{name}
+/oauthrelay/relays/{name}
 ```
 
 Each parameter uses the SSM `String` type and contains one complete YAML or JSON resource document.
 The path kind and name must match `kind` and `metadata.name` in the document. Names occupy exactly
-one path segment. `Broker` is reserved and rejects the candidate snapshot because brokered issuer
-mode is unavailable.
+one path segment.
 
-For example, store the first document at `/oauthmux/upstreams/google` and the second at
-`/oauthmux/relays/cognito-google`:
+For example, store the first document at `/oauthrelay/upstreams/google` and the second at
+`/oauthrelay/relays/cognito-google`:
 
-```yaml oauthmux-config
-apiVersion: oauthmux.dev/v1alpha1
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
   name: google
@@ -47,9 +45,9 @@ spec:
     clientSecret:
       valueFrom:
         awsSsmParameter:
-          name: /oauthmux/secrets/google-client-secret
+          name: /oauthrelay/secrets/google-client-secret
 ---
-apiVersion: oauthmux.dev/v1alpha1
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
   name: cognito-google
@@ -72,7 +70,7 @@ An SSM reference names an absolute parameter. The referenced parameter must use 
 clientSecret:
   valueFrom:
     awsSsmParameter:
-      name: /oauthmux/secrets/google-client-secret
+      name: /oauthrelay/secrets/google-client-secret
 ```
 
 Resource discovery does not enumerate the secrets subtree; each secret is fetched by its exact
@@ -91,7 +89,7 @@ Without `jsonKey`, the complete `SecretString` is the client secret:
 clientSecret:
   valueFrom:
     awsSecretsManager:
-      secretId: oauthmux/google
+      secretId: oauthrelay/google
 ```
 
 With `jsonKey`, the `SecretString` must contain a JSON object and the selected top-level field must
@@ -101,7 +99,7 @@ be a string:
 clientSecret:
   valueFrom:
     awsSecretsManager:
-      secretId: oauthmux/google
+      secretId: oauthrelay/google
       jsonKey: clientSecret
 ```
 
@@ -146,20 +144,19 @@ The runtime role needs permissions equivalent to:
       "Effect": "Allow",
       "Action": "ssm:GetParametersByPath",
       "Resource": [
-        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/upstreams/*",
-        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/relays/*",
-        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/brokers/*"
+        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthrelay/upstreams/*",
+        "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthrelay/relays/*"
       ]
     },
     {
       "Effect": "Allow",
       "Action": "ssm:GetParameter",
-      "Resource": "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthmux/secrets/*"
+      "Resource": "arn:aws:ssm:REGION:ACCOUNT:parameter/oauthrelay/secrets/*"
     },
     {
       "Effect": "Allow",
       "Action": "secretsmanager:GetSecretValue",
-      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:oauthmux/*"
+      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT:secret:oauthrelay/*"
     },
     {
       "Effect": "Allow",
@@ -181,5 +178,5 @@ failure retains the last-good snapshot.
 
 SSM reads are not transactional. During a multi-parameter rollout, an inconsistent candidate is
 rejected until a later refresh observes a complete valid graph. Lambda performs the same load at
-invocation boundaries according to `OAUTHMUX_LAMBDA_CONFIG_TTL`; see
-[Runtime and deployment](/oauthmux/reference/runtime/).
+invocation boundaries according to `OAUTHRELAY_LAMBDA_CONFIG_TTL`; see
+[Runtime and deployment](/oauthrelay/reference/runtime/).

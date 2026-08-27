@@ -10,8 +10,8 @@ use std::{
 use url::Url;
 
 const DEX_ISSUER: &str = "http://127.0.0.1:15556/dex";
-const MUX_BASE: &str = "http://127.0.0.1:18080";
-const MUX_PUBLIC_URL: &str = "http://127.0.0.1:18080/oidc";
+const RELAY_BASE: &str = "http://127.0.0.1:18080";
+const RELAY_PUBLIC_URL: &str = "http://127.0.0.1:18080/oidc";
 const APP_CALLBACK: &str = "http://127.0.0.1:19090/callback";
 
 struct ChildGuard(Child);
@@ -88,18 +88,18 @@ async fn dex_authorization_code_and_refresh_flow() {
     std::fs::write(
         &config_path,
         format!(
-            r#"apiVersion: oauthmux.dev/v1alpha1
+            r#"apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
   name: dex
 spec:
   issuerUrl: {DEX_ISSUER}
   oauthClient:
-    clientId: oauthmux-e2e
+    clientId: oauthrelay-e2e
     clientSecret:
-      value: oauthmux-e2e-secret
+      value: oauthrelay-e2e-secret
 ---
-apiVersion: oauthmux.dev/v1alpha1
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
   name: dex
@@ -117,31 +117,31 @@ spec:
         ),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_oauthmux"))
-        .env("OAUTHMUX_PUBLIC_URL", MUX_PUBLIC_URL)
-        .env("OAUTHMUX_LISTEN", "127.0.0.1:18080")
+    let child = Command::new(env!("CARGO_BIN_EXE_oauthrelay"))
+        .env("OAUTHRELAY_PUBLIC_URL", RELAY_PUBLIC_URL)
+        .env("OAUTHRELAY_LISTEN", "127.0.0.1:18080")
         .env(
-            "OAUTHMUX_SEAL_KEY",
+            "OAUTHRELAY_SEAL_KEY",
             "base64:ERERERERERERERERERERERERERERERERERERERERERE=",
         )
-        .env("OAUTHMUX_PROVIDER_FILE", &config_path)
-        .env("OAUTHMUX_PROVIDER_FILE_POLL", "10m")
+        .env("OAUTHRELAY_PROVIDER_FILE", &config_path)
+        .env("OAUTHRELAY_PROVIDER_FILE_POLL", "10m")
         .env_remove("AWS_LAMBDA_RUNTIME_API")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     let _guard = ChildGuard(child);
-    wait_ready(&no_redirect, &format!("{MUX_BASE}/readyz")).await;
+    wait_ready(&no_redirect, &format!("{RELAY_BASE}/readyz")).await;
 
     let verifier = "dex-e2e-verifier-with-at-least-forty-three-characters";
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let nonce = "dex-e2e-nonce";
-    let mut authorize = Url::parse(&format!("{MUX_PUBLIC_URL}/relay/dex/authorize")).unwrap();
+    let mut authorize = Url::parse(&format!("{RELAY_PUBLIC_URL}/relay/dex/authorize")).unwrap();
     authorize
         .query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair("client_id", "oauthmux-e2e")
+        .append_pair("client_id", "oauthrelay-e2e")
         .append_pair("redirect_uri", APP_CALLBACK)
         .append_pair("state", "dex-e2e-state")
         .append_pair("scope", "openid email profile offline_access")
@@ -154,7 +154,7 @@ spec:
     let code = parameter(&application, "code");
 
     let token = no_redirect
-        .post(format!("{MUX_PUBLIC_URL}/relay/dex/token"))
+        .post(format!("{RELAY_PUBLIC_URL}/relay/dex/token"))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -191,14 +191,14 @@ spec:
         .unwrap();
     let mut validation = Validation::new(header.alg);
     validation.set_issuer(&[DEX_ISSUER]);
-    validation.set_audience(&["oauthmux-e2e"]);
+    validation.set_audience(&["oauthrelay-e2e"]);
     let claims = decode::<Value>(id_token, &DecodingKey::from_jwk(jwk).unwrap(), &validation)
         .unwrap()
         .claims;
     assert_eq!(claims["nonce"], nonce);
 
     let refresh = no_redirect
-        .post(format!("{MUX_PUBLIC_URL}/relay/dex/token"))
+        .post(format!("{RELAY_PUBLIC_URL}/relay/dex/token"))
         .form(&[
             ("grant_type", "refresh_token"),
             ("refresh_token", token["refresh_token"].as_str().unwrap()),
@@ -211,7 +211,7 @@ spec:
     assert!(refresh.json::<Value>().await.unwrap()["access_token"].is_string());
 
     let replay = no_redirect
-        .post(format!("{MUX_PUBLIC_URL}/relay/dex/token"))
+        .post(format!("{RELAY_PUBLIC_URL}/relay/dex/token"))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -225,7 +225,7 @@ spec:
 
     let invalid_redirect = no_redirect
         .get(format!(
-            "{MUX_PUBLIC_URL}/relay/dex/authorize?redirect_uri=https%3A%2F%2Fevil.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
+            "{RELAY_PUBLIC_URL}/relay/dex/authorize?redirect_uri=https%3A%2F%2Fevil.example%2Fcallback&code_challenge={challenge}&code_challenge_method=S256"
         ))
         .send()
         .await

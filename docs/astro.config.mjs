@@ -3,20 +3,20 @@ import starlight from '@astrojs/starlight';
 
 export default defineConfig({
   site: 'https://rise-deploy.github.io',
-  base: '/oauthmux',
+  base: '/oauthrelay',
   integrations: [
     starlight({
-      title: 'oauthmux',
+      title: 'oauthrelay',
       description: 'Stable OAuth callbacks and explicit OIDC relay boundaries.',
       customCss: ['./src/styles/custom.css'],
       editLink: {
-        baseUrl: 'https://github.com/rise-deploy/oauthmux/edit/develop/docs/',
+        baseUrl: 'https://github.com/rise-deploy/oauthrelay/edit/develop/docs/',
       },
       social: [
         {
           icon: 'github',
           label: 'GitHub',
-          href: 'https://github.com/rise-deploy/oauthmux',
+          href: 'https://github.com/rise-deploy/oauthrelay',
         },
       ],
       sidebar: [
@@ -24,7 +24,7 @@ export default defineConfig({
         { label: 'Getting started', slug: 'getting-started' },
         {
           label: 'Concepts',
-          items: [{ label: 'Operating modes', slug: 'modes' }],
+          items: [{ label: 'Relay trust model', slug: 'relay-model' }],
         },
         {
           label: 'Guides',

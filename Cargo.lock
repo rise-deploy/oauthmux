@@ -1816,7 +1816,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "oauthmux"
+name = "oauthrelay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1828,9 +1828,9 @@ dependencies = [
  "base64",
  "jsonwebtoken",
  "lambda_http",
- "oauthmux-core",
- "oauthmux-provider-file",
- "oauthmux-provider-ssm",
+ "oauthrelay-core",
+ "oauthrelay-provider-file",
+ "oauthrelay-provider-ssm",
  "reqwest",
  "serde",
  "serde_json",
@@ -1844,7 +1844,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "oauthmux-core"
+name = "oauthrelay-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1874,13 +1874,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "oauthmux-provider-file"
+name = "oauthrelay-provider-file"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "oauthmux-core",
- "oauthmux-secret-resolver",
+ "oauthrelay-core",
+ "oauthrelay-secret-resolver",
  "serde",
  "serde_yaml",
  "tempfile",
@@ -1889,15 +1889,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "oauthmux-provider-ssm"
+name = "oauthrelay-provider-ssm"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "aws-sdk-secretsmanager",
  "aws-sdk-ssm",
- "oauthmux-core",
- "oauthmux-secret-resolver",
+ "oauthrelay-core",
+ "oauthrelay-secret-resolver",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1906,12 +1906,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "oauthmux-secret-resolver"
+name = "oauthrelay-secret-resolver"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "oauthmux-core",
+ "oauthrelay-core",
  "tempfile",
  "tokio",
 ]

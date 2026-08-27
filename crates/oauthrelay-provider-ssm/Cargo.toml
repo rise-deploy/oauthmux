@@ -1,6 +1,6 @@
 [package]
-name = "oauthmux-provider-ssm"
-description = "AWS SSM Parameter Store configuration provider for oauthmux"
+name = "oauthrelay-provider-ssm"
+description = "AWS SSM Parameter Store configuration provider for oauthrelay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,8 +16,8 @@ anyhow.workspace = true
 async-trait.workspace = true
 aws-sdk-secretsmanager = { workspace = true, optional = true }
 aws-sdk-ssm = { workspace = true, optional = true }
-oauthmux-core = { path = "../oauthmux-core" }
-oauthmux-secret-resolver = { path = "../oauthmux-secret-resolver" }
+oauthrelay-core = { path = "../oauthrelay-core" }
+oauthrelay-secret-resolver = { path = "../oauthrelay-secret-resolver" }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

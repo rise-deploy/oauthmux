@@ -1,6 +1,6 @@
 [package]
-name = "oauthmux-provider-file"
-description = "YAML configuration provider for oauthmux"
+name = "oauthrelay-provider-file"
+description = "YAML configuration provider for oauthrelay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,8 +10,8 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-oauthmux-core = { path = "../oauthmux-core" }
-oauthmux-secret-resolver = { path = "../oauthmux-secret-resolver" }
+oauthrelay-core = { path = "../oauthrelay-core" }
+oauthrelay-secret-resolver = { path = "../oauthrelay-secret-resolver" }
 serde.workspace = true
 serde_yaml.workspace = true
 tokio.workspace = true

@@ -114,7 +114,7 @@ jobs:
             type=ref,event=tag
       - uses: useblacksmith/setup-docker-builder@v2
         with:
-          cache-key: oauthmux-${{ matrix.architecture }}
+          cache-key: oauthrelay-${{ matrix.architecture }}
       - uses: useblacksmith/build-push-action@v2
         id: build
         with:

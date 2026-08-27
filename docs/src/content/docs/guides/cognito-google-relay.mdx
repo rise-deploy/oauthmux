@@ -1,6 +1,6 @@
 ---
 title: Cognito relay to Google
-description: Connect an Amazon Cognito user pool to Google through oauthmux transparent relay.
+description: Connect an Amazon Cognito user pool to Google through oauthrelay transparent relay.
 sidebar:
   order: 1
 ---
@@ -8,28 +8,28 @@ sidebar:
 import Mermaid from '../../../components/Mermaid.astro';
 
 This layout lets one Google OAuth client serve many Amazon Cognito user pools through one stable
-oauthmux callback. Each pool talks to the same relay for authorization and token exchange. That
+oauthrelay callback. Each pool talks to the same relay for authorization and token exchange. That
 relay references the shared Google upstream, while Cognito validates Google's ID token and obtains
 claims from Google's UserInfo endpoint. The URLs below use
-`OAUTHMUX_PUBLIC_URL=https://login.example.com/oidc`.
+`OAUTHRELAY_PUBLIC_URL=https://login.example.com/oidc`.
 
 <Mermaid
   label="Multiple Cognito user pools use one relay backed by one Google upstream and one stable callback registered with Google."
   chart={`flowchart LR
     B[Browser]
     C[Cognito user pools]
-    M[oauthmux]
+    M[oauthrelay]
     G[Google OAuth]
 
     B --> C
     C -->|authorize and token| M
     M -->|authorize and code exchange| G
-    G -->|oauthmux callback| M
+    G -->|oauthrelay callback| M
     M -->|Google-signed tokens| C
     C -.->|JWKS and UserInfo| G`}
 />
 
-## Why oauthmux fits this topology
+## Why oauthrelay fits this topology
 
 Google sees one OAuth client and one allowed redirect URL regardless of how many Cognito pools use
 it:
@@ -38,16 +38,16 @@ it:
 https://login.example.com/oidc/upstream/google/callback
 ```
 
-oauthmux remembers which validated Cognito `/oauth2/idpresponse` URL started each flow and returns
+oauthrelay remembers which validated Cognito `/oauth2/idpresponse` URL started each flow and returns
 the result to that pool. All participating pools share the Google client ID, consent boundary,
-scopes, and oauthmux downstream client credential. Their callback origins remain explicit in the
-oauthmux allow-list.
+scopes, and oauthrelay downstream client credential. Their callback origins remain explicit in the
+oauthrelay allow-list.
 
 Use one `google` upstream for the shared Google OAuth client and one `cognito-google` relay when
 the pools share scopes, downstream authentication, and redirect policy. Additional relays can
 reference the same upstream when those policies differ; they retain the same Google callback.
 Separate upstreams represent independent Google OAuth client registrations and therefore have
-independent callbacks and credentials. Separate oauthmux deployments provide operational
+independent callbacks and credentials. Separate oauthrelay deployments provide operational
 isolation.
 
 ## The three configurations
@@ -62,17 +62,17 @@ https://login.example.com/oidc/upstream/google/callback
 ```
 
 The client needs the OpenID Connect scopes Cognito will request, normally `openid`, `email`, and
-`profile`. Keep the Google client ID and secret available for both the oauthmux upstream
+`profile`. Keep the Google client ID and secret available for both the oauthrelay upstream
 configuration and the Cognito provider configuration.
 
-### 2. oauthmux resources
+### 2. oauthrelay resources
 
 Configure Google as the upstream and reference it from a relay that permits the hosted-domain
 origin of every participating Cognito pool. `UpstreamClient` authentication checks the credentials
-each pool sends to oauthmux against the Google OAuth client credentials.
+each pool sends to oauthrelay against the Google OAuth client credentials.
 
-```yaml oauthmux-config
-apiVersion: oauthmux.dev/v1alpha1
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
   name: google
@@ -89,7 +89,7 @@ spec:
         env:
           name: GOOGLE_CLIENT_SECRET
 ---
-apiVersion: oauthmux.dev/v1alpha1
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
   name: cognito-google
@@ -106,31 +106,31 @@ spec:
     - uri: https://pool-b.auth.us-east-1.amazoncognito.com/oauth2/idpresponse
 ```
 
-Each entry names one complete Cognito callback. oauthmux compares the decoded `redirect_uri`
+Each entry names one complete Cognito callback. oauthrelay compares the decoded `redirect_uri`
 exactly before starting the flow, including its path and any configured query.
 
 ### Store the shared upstream in SSM
 
 For Lambda deployments, the SSM provider is a good fit for a redirect policy that changes as Cognito
 pools are created. Store the complete documents as `String` parameters named
-`/oauthmux/upstreams/google` and `/oauthmux/relays/cognito-google`. Add each pool callback to the
+`/oauthrelay/upstreams/google` and `/oauthrelay/relays/cognito-google`. Add each pool callback to the
 relay document. Store the Google secret separately as a `SecureString`, for example
-`/oauthmux/secrets/google-client-secret`, and use this source in the upstream document:
+`/oauthrelay/secrets/google-client-secret`, and use this source in the upstream document:
 
 ```yaml
 clientSecret:
   valueFrom:
     awsSsmParameter:
-      name: /oauthmux/secrets/google-client-secret
+      name: /oauthrelay/secrets/google-client-secret
 ```
 
 An AWS Secrets Manager reference with `secretId` and optional `jsonKey` is also supported. The
-[AWS SSM provider reference](/oauthmux/reference/ssm-provider/) describes the parameter layout,
+[AWS SSM provider reference](/oauthrelay/reference/ssm-provider/) describes the parameter layout,
 secret constraints, IAM permissions, and refresh behavior.
 
-oauthmux loads the initial snapshot during Lambda cold start. A warm execution environment checks
+oauthrelay loads the initial snapshot during Lambda cold start. A warm execution environment checks
 the snapshot age before every invocation and synchronously reloads providers once it reaches
-`OAUTHMUX_LAMBDA_CONFIG_TTL`, which defaults to `60s`. A failed SSM refresh keeps the last valid
+`OAUTHRELAY_LAMBDA_CONFIG_TTL`, which defaults to `60s`. A failed SSM refresh keeps the last valid
 snapshot. Consequently, an SSM update normally becomes visible to each active environment on its
 first invocation after the TTL expires; no background timer is required while Lambda is frozen.
 
@@ -160,18 +160,18 @@ and include it in the hosted UI's identity-provider choices.
 
 ## Correctness checks
 
-- Google lists the oauthmux callback, not Cognito's `/oauth2/idpresponse`, as its redirect URI.
-- oauthmux allows the exact `/oauth2/idpresponse` URI of every participating pool.
+- Google lists the oauthrelay callback, not Cognito's `/oauth2/idpresponse`, as its redirect URI.
+- oauthrelay allows the exact `/oauth2/idpresponse` URI of every participating pool.
 - Cognito's issuer, JWKS, and UserInfo fields point directly to Google.
 - Cognito's authorization and token fields point to the `cognito-google` relay.
 - The Google client ID is Cognito's provider client ID so the Google ID token audience is valid.
 
-oauthmux forwards Cognito's nonce to Google and returns Google's token response unchanged. Cognito
+oauthrelay forwards Cognito's nonce to Google and returns Google's token response unchanged. Cognito
 therefore validates the nonce, audience, issuer, and signature against the identity Google issued.
 
 See the [Google OpenID Connect documentation](https://developers.google.com/identity/openid-connect/openid-connect)
 and [Cognito OIDC provider documentation](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pools-oidc-idp.html)
 for the provider-side settings represented here.
 
-See [Configuration](/oauthmux/configuration/) for the complete `Upstream` and `Relay` field
+See [Configuration](/oauthrelay/configuration/) for the complete `Upstream` and `Relay` field
 reference.

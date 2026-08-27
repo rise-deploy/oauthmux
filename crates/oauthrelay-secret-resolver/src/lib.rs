@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use oauthmux_core::{SecretResolver, SecretSource, SecretString};
+use oauthrelay_core::{SecretResolver, SecretSource, SecretString};
 use std::{path::PathBuf, sync::Arc};
 
 /// Reads environment and filesystem secret values.
@@ -182,7 +182,7 @@ mod tests {
             );
         }
         let source = SecretSource::AwsSecretsManager {
-            secret_id: "oauthmux/google".into(),
+            secret_id: "oauthrelay/google".into(),
             json_key: Some("clientSecret".into()),
         };
         assert_eq!(

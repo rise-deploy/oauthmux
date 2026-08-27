@@ -35,7 +35,7 @@ test('image preflight fails without calling AWS', async () => {
     calls.push([command, args]);
     return { code: 0, stdout: JSON.stringify(index), stderr: '' };
   };
-  const image = await preflightImage(runner, 'ghcr.io/rise-deploy/oauthmux:sha-1234567', 'arm64');
+  const image = await preflightImage(runner, 'ghcr.io/rise-deploy/oauthrelay:sha-1234567', 'arm64');
   assert.equal(image.digest, 'sha256:arm64');
   assert.deepEqual(calls.map(([command]) => command), ['docker']);
 
@@ -47,7 +47,7 @@ test('image preflight fails without calling AWS', async () => {
 
 test('builds run-scoped resources and a shared secret reference', () => {
   const names = namesForRun('20260826t210000-abcd');
-  assert.equal(names.ssmPrefix, '/oauthmux-e2e/20260826t210000-abcd/');
+  assert.equal(names.ssmPrefix, '/oauthrelay-e2e/20260826t210000-abcd/');
   const documents = resourceDocuments('arn:aws:secretsmanager:eu-west-1:123:secret:test', 'client');
   assert.equal(
     documents.upstream.spec.oauthClient.clientSecret.valueFrom.awsSecretsManager.secretId,
@@ -86,13 +86,13 @@ test('deploy wires the selected image, SSM resources, secret, role, and public U
     processCalls.push({ command, args, options });
     return { code: 0, stdout: '', stderr: '' };
   };
-  const workdir = await mkdtemp(join(tmpdir(), 'oauthmux-script-test-'));
+  const workdir = await mkdtemp(join(tmpdir(), 'oauthrelay-script-test-'));
   const names = namesForRun('20260826t210000-abcd');
   try {
     const result = await deploy({
       options: {},
       image: {
-        image: 'ghcr.io/rise-deploy/oauthmux:sha-1234567',
+        image: 'ghcr.io/rise-deploy/oauthrelay:sha-1234567',
         digest: 'sha256:arm64',
         architecture: 'arm64',
         sourceRevision: '1234567',
@@ -135,9 +135,9 @@ test('deploy wires the selected image, SSM resources, secret, role, and public U
     );
 
     const environment = JSON.parse(await readFile(join(workdir, 'lambda-environment.json'), 'utf8'));
-    assert.equal(environment.Variables.OAUTHMUX_PUBLIC_URL, result.publicUrl);
-    assert.equal(environment.Variables.OAUTHMUX_PROVIDER_SSM_PREFIX, names.ssmPrefix);
-    assert.equal(environment.Variables.OAUTHMUX_LAMBDA_CONFIG_TTL, '60s');
+    assert.equal(environment.Variables.OAUTHRELAY_PUBLIC_URL, result.publicUrl);
+    assert.equal(environment.Variables.OAUTHRELAY_PROVIDER_SSM_PREFIX, names.ssmPrefix);
+    assert.equal(environment.Variables.OAUTHRELAY_LAMBDA_CONFIG_TTL, '60s');
   } finally {
     await rm(workdir, { recursive: true, force: true });
   }
@@ -148,12 +148,12 @@ test('execution policy is limited to the run prefix and exact secret', () => {
     partition: 'aws',
     region: 'eu-west-1',
     accountId: '123456789012',
-    ssmPrefix: '/oauthmux-e2e/run/',
+    ssmPrefix: '/oauthrelay-e2e/run/',
     secretArn: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:run',
   });
   assert.equal(
     policy.Statement[1].Resource,
-    'arn:aws:ssm:eu-west-1:123456789012:parameter/oauthmux-e2e/run/*',
+    'arn:aws:ssm:eu-west-1:123456789012:parameter/oauthrelay-e2e/run/*',
   );
   assert.equal(policy.Statement[2].Resource, 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:run');
 });

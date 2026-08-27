@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use oauthmux_core::{
+use oauthrelay_core::{
     compile_resources, ConfigProvider, ProviderSnapshot, ResourceDocument, SecretResolver,
     SecretSource, SecretString,
 };
-use oauthmux_secret_resolver::{LocalSecrets, StandardSecretResolver, SystemLocalSecrets};
+use oauthrelay_secret_resolver::{LocalSecrets, StandardSecretResolver, SystemLocalSecrets};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
-pub const DEFAULT_PREFIX: &str = "/oauthmux/";
+pub const DEFAULT_PREFIX: &str = "/oauthrelay/";
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,7 +176,7 @@ impl<C, S> SsmProvider<C, S> {
 impl<C: SsmClient, S: SecretsManagerClient> SsmProvider<C, S> {
     pub async fn load(&self) -> anyhow::Result<ProviderSnapshot> {
         let mut documents = Vec::new();
-        for plural in ["upstreams", "relays", "brokers"] {
+        for plural in ["upstreams", "relays"] {
             let path = format!("{}{plural}/", self.prefix);
             let mut token = None;
             loop {
@@ -256,16 +256,15 @@ fn expected_identity<'a>(prefix: &str, name: &'a str) -> anyhow::Result<(&'stati
     let segments: Vec<_> = relative.split('/').collect();
     if segments.len() != 2 || segments[1].is_empty() {
         return Err(anyhow!(
-            "{name}: expected {prefix}{{upstreams|relays|brokers}}/{{name}}"
+            "{name}: expected {prefix}{{upstreams|relays}}/{{name}}"
         ));
     }
     let kind = match segments[0] {
         "upstreams" => "Upstream",
         "relays" => "Relay",
-        "brokers" => return Err(anyhow!("{name}: Broker resources are not supported")),
         _ => {
             return Err(anyhow!(
-                "{name}: expected an upstreams, relays, or brokers resource path"
+                "{name}: expected an upstreams or relays resource path"
             ))
         }
     };
@@ -382,6 +381,7 @@ mod tests {
         resources: Vec<Parameter>,
         secrets: HashMap<String, Parameter>,
         calls: Mutex<Vec<String>>,
+        resource_paths: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -391,6 +391,7 @@ mod tests {
             path: &str,
             _: Option<String>,
         ) -> anyhow::Result<ParameterPage> {
+            self.resource_paths.lock().unwrap().push(path.to_owned());
             Ok(ParameterPage {
                 parameters: self
                     .resources
@@ -424,7 +425,7 @@ mod tests {
 
     fn upstream(secret: &str) -> String {
         format!(
-            r#"apiVersion: oauthmux.dev/v1alpha1
+            r#"apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
   name: google
@@ -439,7 +440,7 @@ spec:
     }
 
     fn relay() -> String {
-        r#"apiVersion: oauthmux.dev/v1alpha1
+        r#"apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
   name: cognito-google
@@ -469,11 +470,12 @@ spec:
     ) -> (ProviderSnapshot, Arc<MockSsm>, Arc<MockSecretsManager>) {
         let ssm = Arc::new(MockSsm {
             resources: vec![
-                resource("/oauthmux/upstreams/google", upstream(secret)),
-                resource("/oauthmux/relays/cognito-google", relay()),
+                resource("/oauthrelay/upstreams/google", upstream(secret)),
+                resource("/oauthrelay/relays/cognito-google", relay()),
             ],
             secrets: ssm_secrets,
             calls: Mutex::new(vec![]),
+            resource_paths: Mutex::new(vec![]),
         });
         let manager = Arc::new(MockSecretsManager {
             secrets: manager_secrets,
@@ -492,9 +494,9 @@ spec:
 
     #[tokio::test]
     async fn resolves_secure_ssm_parameter() {
-        let secret_name = "/oauthmux/secrets/google";
+        let secret_name = "/oauthrelay/secrets/google";
         let (snapshot, ssm, manager) = load(
-            "      valueFrom:\n        awsSsmParameter:\n          name: /oauthmux/secrets/google",
+            "      valueFrom:\n        awsSsmParameter:\n          name: /oauthrelay/secrets/google",
             HashMap::from([(
                 secret_name.into(),
                 Parameter {
@@ -521,11 +523,20 @@ spec:
     }
 
     #[tokio::test]
+    async fn enumerates_only_upstream_and_relay_resources() {
+        let (_, ssm, _) = load("      value: inline", HashMap::new(), HashMap::new()).await;
+        assert_eq!(
+            ssm.resource_paths.lock().unwrap().as_slice(),
+            ["/oauthrelay/upstreams/", "/oauthrelay/relays/"]
+        );
+    }
+
+    #[tokio::test]
     async fn resolves_whole_secrets_manager_secret_string() {
         let (snapshot, _, manager) = load(
-            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google",
+            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthrelay/google",
             HashMap::new(),
-            HashMap::from([("oauthmux/google".into(), Some("whole-secret".into()))]),
+            HashMap::from([("oauthrelay/google".into(), Some("whole-secret".into()))]),
         )
         .await;
         assert_eq!(
@@ -540,17 +551,17 @@ spec:
         );
         assert_eq!(
             manager.calls.lock().unwrap().as_slice(),
-            ["oauthmux/google"]
+            ["oauthrelay/google"]
         );
     }
 
     #[tokio::test]
     async fn resolves_secrets_manager_json_key() {
         let (snapshot, _, _) = load(
-            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
+            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthrelay/google\n          jsonKey: clientSecret",
             HashMap::new(),
             HashMap::from([(
-                "oauthmux/google".into(),
+                "oauthrelay/google".into(),
                 Some(r#"{"clientId":"id","clientSecret":"selected"}"#.into()),
             )]),
         )
@@ -573,15 +584,15 @@ spec:
             let ssm = Arc::new(MockSsm {
                 resources: vec![
                     resource(
-                        "/oauthmux/upstreams/google",
-                        upstream("      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret"),
+                        "/oauthrelay/upstreams/google",
+                        upstream("      valueFrom:\n        awsSecretsManager:\n          secretId: oauthrelay/google\n          jsonKey: clientSecret"),
                     ),
-                    resource("/oauthmux/relays/cognito-google", relay()),
+                    resource("/oauthrelay/relays/cognito-google", relay()),
                 ],
                 ..Default::default()
             });
             let manager = Arc::new(MockSecretsManager {
-                secrets: HashMap::from([("oauthmux/google".into(), Some(secret.into()))]),
+                secrets: HashMap::from([("oauthrelay/google".into(), Some(secret.into()))]),
                 ..Default::default()
             });
             let provider =
@@ -597,12 +608,15 @@ spec:
         let manager = Arc::new(MockSecretsManager::default());
         for parameter in [
             resource(
-                "/oauthmux/upstreams/team/google",
+                "/oauthrelay/upstreams/team/google",
                 upstream("      value: hidden"),
             ),
-            resource("/oauthmux/upstreams/wrong", upstream("      value: hidden")),
+            resource(
+                "/oauthrelay/upstreams/wrong",
+                upstream("      value: hidden"),
+            ),
             Parameter {
-                name: "/oauthmux/upstreams/google".into(),
+                name: "/oauthrelay/upstreams/google".into(),
                 value: upstream("      value: hidden"),
                 parameter_type: ParameterType::SecureString,
             },
@@ -648,8 +662,8 @@ spec:
         ] {
             let ssm = Arc::new(MockSsm {
                 resources: vec![
-                    resource("/oauthmux/upstreams/google", upstream(secret)),
-                    resource("/oauthmux/relays/cognito-google", relay()),
+                    resource("/oauthrelay/upstreams/google", upstream(secret)),
+                    resource("/oauthrelay/relays/cognito-google", relay()),
                 ],
                 ..Default::default()
             });
@@ -680,10 +694,10 @@ spec:
         let ssm = Arc::new(MockSsm {
             resources: vec![
                 resource(
-                    "/oauthmux/upstreams/google",
+                    "/oauthrelay/upstreams/google",
                     upstream("      valueFrom:\n        file:\n          path: relative-secret"),
                 ),
-                resource("/oauthmux/relays/cognito-google", relay()),
+                resource("/oauthrelay/relays/cognito-google", relay()),
             ],
             ..Default::default()
         });
@@ -700,16 +714,16 @@ spec:
 
     #[tokio::test]
     async fn rejects_non_secure_referenced_ssm_parameter_and_binary_secret() {
-        let secret_name = "/oauthmux/secrets/google";
+        let secret_name = "/oauthrelay/secrets/google";
         let ssm = Arc::new(MockSsm {
             resources: vec![
                 resource(
-                    "/oauthmux/upstreams/google",
+                    "/oauthrelay/upstreams/google",
                     upstream(
-                        "      valueFrom:\n        awsSsmParameter:\n          name: /oauthmux/secrets/google",
+                        "      valueFrom:\n        awsSsmParameter:\n          name: /oauthrelay/secrets/google",
                     ),
                 ),
-                resource("/oauthmux/relays/cognito-google", relay()),
+                resource("/oauthrelay/relays/cognito-google", relay()),
             ],
             secrets: HashMap::from([(
                 secret_name.into(),
@@ -733,17 +747,17 @@ spec:
         let ssm = Arc::new(MockSsm {
             resources: vec![
                 resource(
-                    "/oauthmux/upstreams/google",
+                    "/oauthrelay/upstreams/google",
                     upstream(
-                        "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google",
+                        "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthrelay/google",
                     ),
                 ),
-                resource("/oauthmux/relays/cognito-google", relay()),
+                resource("/oauthrelay/relays/cognito-google", relay()),
             ],
             ..Default::default()
         });
         let manager = Arc::new(MockSecretsManager {
-            secrets: HashMap::from([("oauthmux/google".into(), None)]),
+            secrets: HashMap::from([("oauthrelay/google".into(), None)]),
             ..Default::default()
         });
         let provider =

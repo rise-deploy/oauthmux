@@ -1,11 +1,11 @@
 ---
 title: Verify a Google relay on AWS Lambda
-description: Exercise a published oauthmux image through a real Google authorization flow.
+description: Exercise a published oauthrelay image through a real Google authorization flow.
 sidebar:
   order: 2
 ---
 
-The live verification script deploys an isolated oauthmux relay to AWS Lambda, completes a Google
+The live verification script deploys an isolated oauthrelay relay to AWS Lambda, completes a Google
 authorization-code flow through it, and removes the AWS resources. It proves that the published
 container, Lambda runtime, SSM provider, Secrets Manager resolution, public URL base path, relay
 discovery, redirect policy, PKCE exchange, Google ID token, and UserInfo request work together.
@@ -21,7 +21,7 @@ You need:
 - AWS credentials allowed to manage run-scoped ECR, Lambda, IAM, SSM Parameter Store, Secrets
   Manager, and CloudWatch Logs resources;
 - a Google OAuth 2.0 **Web application** client whose redirect URI you can edit; and
-- a published multi-architecture oauthmux image.
+- a published multi-architecture oauthrelay image.
 
 The repository's mise configuration supplies Node.js, the AWS CLI, and the Docker CLI. A running
 Docker engine and authenticated AWS CLI credentials remain host responsibilities.
@@ -39,7 +39,7 @@ The script reads the Google client secret from a hidden prompt. For automation, 
 not accepted as a command-line argument.
 
 By default, the script derives
-`ghcr.io/rise-deploy/oauthmux:sha-<7-character-HEAD>` and verifies that its OCI index contains a
+`ghcr.io/rise-deploy/oauthrelay:sha-<7-character-HEAD>` and verifies that its OCI index contains a
 Linux ARM64 image before creating AWS resources. Use `--image` to test another published tag or
 `--architecture amd64` for an x86-64 Lambda.
 
@@ -54,13 +54,13 @@ and listens on a random local loopback port for the result. `--no-open` prints t
 launching a browser.
 
 The checks confirm that the relay rejects an unconfigured redirect, advertises Google's issuer and
-JWKS while publishing oauthmux authorization and token endpoints, completes S256 PKCE, validates
+JWKS while publishing oauthrelay authorization and token endpoints, completes S256 PKCE, validates
 the Google-signed ID token, and obtains matching UserInfo. Remove the generated callback from the
 Google client when the script tells you to do so.
 
 ## Resources and cleanup
 
-Each run has a unique `oauthmux-e2e-<run-id>` namespace. The script creates:
+Each run has a unique `oauthrelay-e2e-<run-id>` namespace. The script creates:
 
 - a temporary private ECR repository containing the selected single-architecture image;
 - a Secrets Manager secret for the Google client secret;
@@ -69,7 +69,7 @@ Each run has a unique `oauthmux-e2e-<run-id>` namespace. The script creates:
 - a Lambda function and unauthenticated Function URL; and
 - the function's CloudWatch log group when Lambda emits logs.
 
-The Function URL is intentionally public for the duration of this test. oauthmux is served below
+The Function URL is intentionally public for the duration of this test. oauthrelay is served below
 its `/oidc` public base, while `/readyz` remains at the Function URL root. The run-scoped SSM
 configuration refresh TTL is `60s`.
 

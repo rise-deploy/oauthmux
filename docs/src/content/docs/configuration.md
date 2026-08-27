@@ -1,14 +1,14 @@
 ---
 title: Configuration
-description: Reference for oauthmux Upstream and Relay resources, policies, and secret values.
+description: Reference for oauthrelay Upstream and Relay resources, policies, and secret values.
 ---
 
-oauthmux configuration is a stream of strict, versioned resources. Each resource has an API
+oauthrelay configuration is a stream of strict, versioned resources. Each resource has an API
 version, kind, name, and kind-specific specification. Unknown fields, unsupported API versions,
 duplicate identities, and invalid references reject the complete candidate snapshot.
 
-```yaml oauthmux-config
-apiVersion: oauthmux.dev/v1alpha1
+```yaml oauthrelay-config
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
   name: google
@@ -25,7 +25,7 @@ spec:
         env:
           name: GOOGLE_CLIENT_SECRET
 ---
-apiVersion: oauthmux.dev/v1alpha1
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
   name: cognito-google
@@ -50,8 +50,8 @@ and redirect policy. Several relays can reference one upstream and use the same 
 
 | Field | Required | Meaning |
 | --- | --- | --- |
-| `apiVersion` | yes | Exactly `oauthmux.dev/v1alpha1`. |
-| `kind` | yes | `Upstream` or `Relay`. `Broker` is reserved but unavailable. |
+| `apiVersion` | yes | Exactly `oauthrelay.dev/v1alpha1`. |
+| `kind` | yes | `Upstream` or `Relay`. |
 | `metadata.name` | yes | URL-safe resource name containing ASCII letters, numbers, `.`, `_`, or `-`. File and SSM resource names occupy one path segment. |
 
 An upstream and a relay may use the same name because identities include the resource kind.
@@ -67,19 +67,19 @@ An upstream and a relay may use the same name because identities include the res
 | `spec.oauthClient.clientId` | yes | Provider OAuth client ID. |
 | `spec.oauthClient.clientSecret` | yes | Provider OAuth client secret as a [secret value](#secret-values). |
 
-`OAUTHMUX_PUBLIC_URL` is the complete externally visible OAuth API base. The callback registered
+`OAUTHRELAY_PUBLIC_URL` is the complete externally visible OAuth API base. The callback registered
 with the provider is derived from that base and the upstream name:
 
 ```text
 https://login.example.com/oidc/upstream/google/callback
 ```
 
-Here `OAUTHMUX_PUBLIC_URL` is `https://login.example.com/oidc`. Set it to another path, such as
-`https://login.example.com/services/oauthmux`, to serve the same API under that path instead.
+Here `OAUTHRELAY_PUBLIC_URL` is `https://login.example.com/oidc`. Set it to another path, such as
+`https://login.example.com/services/oauthrelay`, to serve the same API under that path instead.
 
 Explicit endpoints are useful for providers without standard discovery. When authorization or
-token is omitted, oauthmux reads `{issuerUrl}/.well-known/openid-configuration`. The issuer and
-JWKS remain upstream-owned in transparent relay mode.
+token is omitted, oauthrelay reads `{issuerUrl}/.well-known/openid-configuration`. The issuer and
+JWKS remain upstream-owned by the relay contract.
 
 ## Relay
 
@@ -110,7 +110,7 @@ redirectPolicy:
 
 `uri` compares the complete decoded value exactly, including path, query order, encoding, port,
 and trailing slash. It requires HTTPS, except for an exact HTTP URI on `127.0.0.1` or `::1`.
-Static query parameters participate in matching; oauthmux appends generated authorization results
+Static query parameters participate in matching; oauthrelay appends generated authorization results
 and application state only after the URI passes policy.
 
 `origin` requires HTTPS and matches scheme, host, and effective port. Every path and query at that
@@ -119,7 +119,7 @@ origin is accepted, which suits preview environments whose callback paths vary.
 `loopback` requires HTTP on `127.0.0.1` or `::1` without a configured port. Its path and query
 match exactly while the application may select any runtime port. Use `uri` when a loopback port is
 fixed. `localhost` is not a loopback IP literal; the off-by-default
-`OAUTHMUX_ALLOW_LOCALHOST_LOOPBACK` service option treats it as an alias for a matching IP-literal
+`OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` service option treats it as an alias for a matching IP-literal
 loopback entry.
 
 User information, fragments, wildcards, prefix matching, empty policies, duplicate entries, and
@@ -215,14 +215,14 @@ clientSecret:
 clientSecret:
   valueFrom:
     awsSsmParameter:
-      name: /oauthmux/secrets/google-client-secret
+      name: /oauthrelay/secrets/google-client-secret
 ```
 
 ```yaml
 clientSecret:
   valueFrom:
     awsSecretsManager:
-      secretId: oauthmux/google
+      secretId: oauthrelay/google
       jsonKey: clientSecret
 ```
 
@@ -230,8 +230,8 @@ Resource discovery and secret resolution are separate concerns:
 
 | Provider | Accepted secret forms |
 | --- | --- |
-| [File](/oauthmux/reference/file-provider/) | `value`, `valueFrom.env`, `valueFrom.file`, `valueFrom.awsSsmParameter`, `valueFrom.awsSecretsManager` |
-| [AWS SSM](/oauthmux/reference/ssm-provider/) | `value`, `valueFrom.env`, `valueFrom.file`, `valueFrom.awsSsmParameter`, `valueFrom.awsSecretsManager` |
+| [File](/oauthrelay/reference/file-provider/) | `value`, `valueFrom.env`, `valueFrom.file`, `valueFrom.awsSsmParameter`, `valueFrom.awsSecretsManager` |
+| [AWS SSM](/oauthrelay/reference/ssm-provider/) | `value`, `valueFrom.env`, `valueFrom.file`, `valueFrom.awsSsmParameter`, `valueFrom.awsSecretsManager` |
 
 Both providers use the same resolver implementation. Relative `file.path` values resolve from a
 File provider resource document's directory. SSM resource documents have no filesystem base, so
@@ -246,10 +246,10 @@ a redacted debug representation and are not included in configuration errors.
 Generate the schema directly from the Rust configuration types:
 
 ```console
-oauthmux schema > oauthmux.schema.json
+oauthrelay schema > oauthrelay.schema.json
 ```
 
 The schema describes one resource document; a File provider configuration is a YAML stream of
-those documents. The published [oauthmux JSON Schema](/oauthmux/oauthmux.schema.json) includes
+those documents. The published [oauthrelay JSON Schema](/oauthrelay/oauthrelay.schema.json) includes
 field descriptions, strict unions, and the exact API version. CI checks that it remains synchronized
 with the Rust types.

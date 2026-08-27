@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
-use oauthmux_core::{
+use oauthrelay_core::{
     compile_resources, ConfigProvider, ProviderSnapshot, ResourceDocument, SecretResolver,
 };
-use oauthmux_secret_resolver::{LocalSecrets, StandardSecretResolver, SystemLocalSecrets};
+use oauthrelay_secret_resolver::{LocalSecrets, StandardSecretResolver, SystemLocalSecrets};
 use serde::Deserialize;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::watch;
 
-pub const DEFAULT_PATH: &str = "/etc/oauthmux/config.yaml";
+pub const DEFAULT_PATH: &str = "/etc/oauthrelay/config.yaml";
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct FileProvider {
@@ -115,7 +115,7 @@ fn parse_documents(yaml: &str) -> anyhow::Result<Vec<ResourceDocument>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oauthmux_core::{SecretSource, SecretString};
+    use oauthrelay_core::{SecretSource, SecretString};
     use std::{collections::HashMap, sync::Mutex};
     use tempfile::NamedTempFile;
 
@@ -171,7 +171,7 @@ mod tests {
 
     fn yaml(secret: &str) -> String {
         format!(
-            r#"apiVersion: oauthmux.dev/v1alpha1
+            r#"apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
   name: google
@@ -182,7 +182,7 @@ spec:
     clientSecret:
 {secret}
 ---
-apiVersion: oauthmux.dev/v1alpha1
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
   name: cognito-google
@@ -273,7 +273,7 @@ spec:
     async fn requires_aws_secret_resolution_for_aws_sources() {
         for secret in [
             "      valueFrom:\n        awsSsmParameter:\n          name: /secret",
-            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
+            "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthrelay/google\n          jsonKey: clientSecret",
         ] {
             let file = NamedTempFile::new().unwrap();
             std::fs::write(file.path(), yaml(secret)).unwrap();
@@ -298,9 +298,9 @@ spec:
                 "from-ssm",
             ),
             (
-                "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthmux/google\n          jsonKey: clientSecret",
+                "      valueFrom:\n        awsSecretsManager:\n          secretId: oauthrelay/google\n          jsonKey: clientSecret",
                 SecretSource::AwsSecretsManager {
-                    secret_id: "oauthmux/google".into(),
+                    secret_id: "oauthrelay/google".into(),
                     json_key: Some("clientSecret".into()),
                 },
                 "from-secrets-manager",

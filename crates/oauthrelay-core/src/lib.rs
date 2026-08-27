@@ -4,10 +4,10 @@
 //! routes without depending on a standalone config provider:
 //!
 //! ```no_run
-//! use oauthmux_core::{router, KeyStrategy, MuxConfig, ProviderSnapshot, XChaChaSealer};
+//! use oauthrelay_core::{router, KeyStrategy, RelayConfig, ProviderSnapshot, XChaChaSealer};
 //! use std::sync::Arc;
 //! let resources = ProviderSnapshot::default(); // Populate from the host database.
-//! let config = MuxConfig {
+//! let config = RelayConfig {
 //!     public_url: "https://rise.example.com/oidc".parse().unwrap(),
 //!     sealer: Arc::new(XChaChaSealer::new(&[7; 32], None).unwrap()),
 //!     replay_cache: None,

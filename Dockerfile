@@ -15,12 +15,12 @@ RUN --mount=type=cache,id=cargo-registry-$TARGETARCH,target=/usr/local/cargo/reg
       *) exit 1 ;; \
     esac \
     && rustup target add "$target" \
-    && cargo build --locked --release --target "$target" -p oauthmux \
-    && cp "target/$target/release/oauthmux" /oauthmux
+    && cargo build --locked --release --target "$target" -p oauthrelay \
+    && cp "target/$target/release/oauthrelay" /oauthrelay
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build /oauthmux /oauthmux
+COPY --from=build /oauthrelay /oauthrelay
 USER 65532:65532
 EXPOSE 8080
-ENTRYPOINT ["/oauthmux"]
+ENTRYPOINT ["/oauthrelay"]

@@ -1,6 +1,6 @@
-# oauthmux
+# oauthrelay
 
-`oauthmux` gives an external OAuth/OIDC client one stable callback and safely relays authorization
+`oauthrelay` gives an external OAuth/OIDC client one stable callback and safely relays authorization
 results to an explicit set of application origins. It is an embeddable Axum router and a standalone
 server for native, container, and AWS Lambda deployments.
 
@@ -11,7 +11,7 @@ policy. Several relays can share one upstream without adding provider callbacks.
 ```mermaid
 flowchart LR
     RP[Relying parties]
-    M[oauthmux relay]
+    M[oauthrelay relay]
     U[Upstream OAuth client]
 
     RP -->|authorize and token| M
@@ -20,20 +20,12 @@ flowchart LR
     M -->|validated application redirect| RP
 ```
 
-## Operating modes
+## Trust model
 
-| Mode | Token issuer and signer | Status |
-| --- | --- | --- |
-| Transparent relay | Upstream provider | Available |
-| Brokered issuer | oauthmux | Planned |
-
-Transparent relay returns the upstream token response unchanged. The relying party continues to
+oauthrelay returns the upstream token response unchanged. The relying party continues to
 trust the upstream issuer, JWKS, audience, and UserInfo endpoint while routing authorization and
-token requests through oauthmux. This requires a relying party that supports manual endpoint
+token requests through oauthrelay. This requires a relying party that supports manual endpoint
 configuration; Amazon Cognito is one example.
-
-Brokered issuer will validate the upstream identity and issue a new oauthmux-signed identity. It is
-a separate trust model with its own signing keys, JWKS, audience, claims, and UserInfo contract.
 
 ## Capabilities
 
@@ -44,23 +36,23 @@ a separate trust model with its own signing keys, JWKS, audience, claims, and Us
 - Multi-document File configuration with local or AWS-backed secret references.
 - AWS SSM resource discovery with SSM `SecureString` and Secrets Manager `jsonKey` references.
 - Invocation-driven Lambda configuration refresh with a 60-second default TTL.
-- Multi-architecture images at `ghcr.io/rise-deploy/oauthmux`.
+- Multi-architecture images at `ghcr.io/rise-deploy/oauthrelay`.
 
 ## Documentation
 
-- [Getting started](https://rise-deploy.github.io/oauthmux/getting-started/)
-- [Operating modes](https://rise-deploy.github.io/oauthmux/modes/)
-- [Cognito relay to Google](https://rise-deploy.github.io/oauthmux/guides/cognito-google-relay/)
-- [Configuration reference](https://rise-deploy.github.io/oauthmux/configuration/)
-- [File provider](https://rise-deploy.github.io/oauthmux/reference/file-provider/)
-- [AWS SSM provider](https://rise-deploy.github.io/oauthmux/reference/ssm-provider/)
-- [Runtime and deployment](https://rise-deploy.github.io/oauthmux/reference/runtime/)
-- [HTTP endpoints](https://rise-deploy.github.io/oauthmux/reference/http-endpoints/)
+- [Getting started](https://rise-deploy.github.io/oauthrelay/getting-started/)
+- [Relay trust model](https://rise-deploy.github.io/oauthrelay/relay-model/)
+- [Cognito relay to Google](https://rise-deploy.github.io/oauthrelay/guides/cognito-google-relay/)
+- [Configuration reference](https://rise-deploy.github.io/oauthrelay/configuration/)
+- [File provider](https://rise-deploy.github.io/oauthrelay/reference/file-provider/)
+- [AWS SSM provider](https://rise-deploy.github.io/oauthrelay/reference/ssm-provider/)
+- [Runtime and deployment](https://rise-deploy.github.io/oauthrelay/reference/runtime/)
+- [HTTP endpoints](https://rise-deploy.github.io/oauthrelay/reference/http-endpoints/)
 
 The executable publishes its configuration contract directly:
 
 ```console
-oauthmux schema > oauthmux.schema.json
+oauthrelay schema > oauthrelay.schema.json
 ```
 
 ## Development
@@ -86,11 +78,11 @@ test contacts Google or Amazon Cognito.
 The workspace contains:
 
 ```text
-crates/oauthmux-core/          protocol engine and embeddable router
-crates/oauthmux-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
-crates/oauthmux-provider-file/ File configuration provider
-crates/oauthmux-provider-ssm/  AWS SSM and Secrets Manager provider
-crates/oauthmux/               standalone native and Lambda runtime
+crates/oauthrelay-core/          protocol engine and embeddable router
+crates/oauthrelay-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
+crates/oauthrelay-provider-file/ File configuration provider
+crates/oauthrelay-provider-ssm/  AWS SSM and Secrets Manager provider
+crates/oauthrelay/               standalone native and Lambda runtime
 ```
 
 The core exposes resolver and replay-cache seams for hosts that need database-backed configuration

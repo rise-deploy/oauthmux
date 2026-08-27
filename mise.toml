@@ -25,19 +25,19 @@ dir = "docs"
 run = "npm ci && npm run build"
 
 [tasks.schema]
-description = "Generate the oauthmux configuration schema"
-run = "cargo run -q -p oauthmux -- schema > docs/public/oauthmux.schema.json"
+description = "Generate the oauthrelay configuration schema"
+run = "cargo run -q -p oauthrelay -- schema > docs/public/oauthrelay.schema.json"
 
 [tasks."schema:check"]
-description = "Check the generated oauthmux configuration schema"
-run = "cargo run -q -p oauthmux -- schema | diff -u docs/public/oauthmux.schema.json -"
+description = "Check the generated oauthrelay configuration schema"
+run = "cargo run -q -p oauthrelay -- schema | diff -u docs/public/oauthrelay.schema.json -"
 
 [tasks."features:check"]
 description = "Check standalone binary feature combinations"
 run = [
-  "cargo check -p oauthmux --no-default-features",
-  "cargo check -p oauthmux --no-default-features --features aws",
-  "cargo check -p oauthmux --no-default-features --features lambda",
+  "cargo check -p oauthrelay --no-default-features",
+  "cargo check -p oauthrelay --no-default-features --features aws",
+  "cargo check -p oauthrelay --no-default-features --features lambda",
 ]
 
 [tasks."docs:serve"]
@@ -50,7 +50,7 @@ description = "Run Docker-backed end-to-end tests"
 run = "bash tests/e2e/run.sh"
 
 [tasks."e2e:aws-google"]
-description = "Verify a published oauthmux image with AWS Lambda and Google OAuth"
+description = "Verify a published oauthrelay image with AWS Lambda and Google OAuth"
 run = "node scripts/aws-google-relay-e2e.mjs"
 
 [tasks."scripts:test"]

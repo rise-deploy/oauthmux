@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use oauthmux_core::{
+use oauthrelay_core::{
     compile_resources, ResourceDocument, SecretResolver, SecretSource, SecretString,
 };
 use serde::Deserialize;
@@ -87,20 +87,20 @@ async fn documentation_yaml_and_json_examples_are_valid() {
                     if fence
                         .info
                         .split_whitespace()
-                        .any(|tag| tag == "oauthmux-config")
+                        .any(|tag| tag == "oauthrelay-config")
                     {
                         resource_examples += 1;
                         let documents = serde_yaml::Deserializer::from_str(&fence.body)
                             .map(|document| {
                                 ResourceDocument::deserialize(document).unwrap_or_else(|error| {
-                                    panic!("{location}: invalid oauthmux resource: {error}")
+                                    panic!("{location}: invalid oauthrelay resource: {error}")
                                 })
                             })
                             .collect();
                         compile_resources(documents, &ExampleSecrets)
                             .await
                             .unwrap_or_else(|error| {
-                                panic!("{location}: invalid oauthmux resource graph: {error:#}")
+                                panic!("{location}: invalid oauthrelay resource graph: {error:#}")
                             });
                     }
                 }
@@ -118,6 +118,6 @@ async fn documentation_yaml_and_json_examples_are_valid() {
     assert!(json_examples > 0, "no JSON documentation examples found");
     assert!(
         resource_examples >= 5,
-        "expected complete oauthmux resource examples across the documentation"
+        "expected complete oauthrelay resource examples across the documentation"
     );
 }

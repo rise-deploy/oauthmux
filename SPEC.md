@@ -1,8 +1,8 @@
-# oauthmux specification
+# oauthrelay specification
 
 ## Mission
 
-oauthmux is a reusable OAuth/OIDC transparent relay in Rust. A named upstream owns one external
+oauthrelay is a reusable OAuth/OIDC transparent relay in Rust. A named upstream owns one external
 OAuth client registration and one stable callback. One or more named relays reference that
 upstream and multiplex authorization results to an explicit set of relying-party redirects.
 
@@ -10,25 +10,25 @@ The protocol engine is an embeddable Axum router. The standalone binary supplies
 configuration providers and runs as a native server or AWS Lambda container.
 
 Transparent relay preserves the upstream token response, issuer, signature, JWKS, audience, and
-UserInfo contract. A relying party sends authorization and token requests through oauthmux while
+UserInfo contract. A relying party sends authorization and token requests through oauthrelay while
 continuing to trust the upstream issuer.
 
 ## Workspace
 
 ```text
 crates/
-  oauthmux-core/          protocol engine, resources, resolver seams, router, sealing
-  oauthmux-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
-  oauthmux-provider-file/ multi-document YAML provider and composable secret resolution
-  oauthmux-provider-ssm/  SSM resource discovery and AWS secret backend
-  oauthmux/               provider wiring, native server, Lambda runtime, schema CLI
+  oauthrelay-core/          protocol engine, resources, resolver seams, router, sealing
+  oauthrelay-secret-resolver/ shared inline, environment, file, and cloud secret dispatch
+  oauthrelay-provider-file/ multi-document YAML provider and composable secret resolution
+  oauthrelay-provider-ssm/  SSM resource discovery and AWS secret backend
+  oauthrelay/               provider wiring, native server, Lambda runtime, schema CLI
 ```
 
-Provider crates depend on `oauthmux-core`; the core has no provider-specific dependency.
+Provider crates depend on `oauthrelay-core`; the core has no provider-specific dependency.
 
 ## Resource model
 
-Configuration uses `oauthmux.dev/v1alpha1` resources. `ResourceKey` is a URL-safe opaque name.
+Configuration uses `oauthrelay.dev/v1alpha1` resources. `ResourceKey` is a URL-safe opaque name.
 
 ```rust
 pub struct Upstream {
@@ -115,7 +115,7 @@ accepts a sealed authorization code for its five-minute cryptographic lifetime.
 The File provider reads a YAML document stream:
 
 ```yaml
-apiVersion: oauthmux.dev/v1alpha1
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Upstream
 metadata:
   name: google
@@ -132,7 +132,7 @@ spec:
         env:
           name: GOOGLE_CLIENT_SECRET
 ---
-apiVersion: oauthmux.dev/v1alpha1
+apiVersion: oauthrelay.dev/v1alpha1
 kind: Relay
 metadata:
   name: cognito-google
@@ -151,7 +151,7 @@ spec:
 Unknown fields, kinds, API versions, duplicate identities, invalid URLs, invalid origins, invalid
 scope tokens, and dangling references reject the candidate snapshot.
 
-`oauthmux schema` prints a JSON Schema generated from the Rust configuration types.
+`oauthrelay schema` prints a JSON Schema generated from the Rust configuration types.
 
 ## Secret sources
 
@@ -163,8 +163,8 @@ The File provider supports:
 clientSecret: { value: local-secret }
 clientSecret: { valueFrom: { env: { name: GOOGLE_CLIENT_SECRET } } }
 clientSecret: { valueFrom: { file: { path: ./secrets/google } } }
-clientSecret: { valueFrom: { awsSsmParameter: { name: /oauthmux/secrets/google } } }
-clientSecret: { valueFrom: { awsSecretsManager: { secretId: oauthmux/google, jsonKey: clientSecret } } }
+clientSecret: { valueFrom: { awsSsmParameter: { name: /oauthrelay/secrets/google } } }
+clientSecret: { valueFrom: { awsSecretsManager: { secretId: oauthrelay/google, jsonKey: clientSecret } } }
 ```
 
 Every configuration provider uses the same standard resolver for inline, environment, file, and
@@ -179,7 +179,7 @@ The SSM provider supports:
 clientSecret:
   valueFrom:
     awsSsmParameter:
-      name: /oauthmux/secrets/google
+      name: /oauthrelay/secrets/google
 ```
 
 The referenced parameter must exist, have an absolute name, and use the `SecureString` type.
@@ -188,7 +188,7 @@ The referenced parameter must exist, have an absolute name, and use the `SecureS
 clientSecret:
   valueFrom:
     awsSecretsManager:
-      secretId: oauthmux/google
+      secretId: oauthrelay/google
       jsonKey: clientSecret
 ```
 
@@ -201,24 +201,22 @@ redacted debug representation and are never included in errors or logs.
 
 ## File provider
 
-`OAUTHMUX_PROVIDER_FILE` names a multi-document YAML file. The provider reloads the resource file
-and referenced local secrets every `OAUTHMUX_PROVIDER_FILE_POLL`, default `30s`. A failed reload
+`OAUTHRELAY_PROVIDER_FILE` names a multi-document YAML file. The provider reloads the resource file
+and referenced local secrets every `OAUTHRELAY_PROVIDER_FILE_POLL`, default `30s`. A failed reload
 retains the complete last-good snapshot.
 
 ## AWS SSM provider
 
-`OAUTHMUX_PROVIDER_SSM_PREFIX` is one absolute root ending in `/`. The provider enumerates the
+`OAUTHRELAY_PROVIDER_SSM_PREFIX` is one absolute root ending in `/`. The provider enumerates the
 fixed resource paths independently:
 
 ```text
 {root}upstreams/{name}
 {root}relays/{name}
-{root}brokers/{name}
 ```
 
 Resource parameters use the SSM `String` type and contain the complete resource document. Path
-kind/name and document kind/name must agree. Names occupy exactly one path segment. `Broker` paths
-are reserved and reject a snapshot because brokered issuer execution is unavailable.
+kind/name and document kind/name must agree. Names occupy exactly one path segment.
 
 The provider handles `GetParametersByPath` pagination and resolves referenced SSM parameters with
 `GetParameter`. Secrets Manager references use `GetSecretValue`. Region and credentials follow the
@@ -232,16 +230,16 @@ valid graph.
 ## Runtime
 
 ```text
-OAUTHMUX_PUBLIC_URL=https://auth.example.com/oidc
-OAUTHMUX_SEAL_KEY=base64:…
-OAUTHMUX_SEAL_KEY_PREVIOUS=base64:…
-OAUTHMUX_LISTEN=0.0.0.0:8080
-OAUTHMUX_PROVIDER_FILE=/etc/oauthmux/config.yaml
-OAUTHMUX_PROVIDER_FILE_POLL=30s
-OAUTHMUX_PROVIDER_SSM_PREFIX=/oauthmux/
-OAUTHMUX_PROVIDER_SSM_POLL=60s
-OAUTHMUX_LAMBDA_CONFIG_TTL=60s
-OAUTHMUX_LOG=info
+OAUTHRELAY_PUBLIC_URL=https://auth.example.com/oidc
+OAUTHRELAY_SEAL_KEY=base64:…
+OAUTHRELAY_SEAL_KEY_PREVIOUS=base64:…
+OAUTHRELAY_LISTEN=0.0.0.0:8080
+OAUTHRELAY_PROVIDER_FILE=/etc/oauthrelay/config.yaml
+OAUTHRELAY_PROVIDER_FILE_POLL=30s
+OAUTHRELAY_PROVIDER_SSM_PREFIX=/oauthrelay/
+OAUTHRELAY_PROVIDER_SSM_POLL=60s
+OAUTHRELAY_LAMBDA_CONFIG_TTL=60s
+OAUTHRELAY_LOG=info
 ```
 
 At least one provider is required. Native mode reloads providers on their polling intervals.
@@ -252,12 +250,5 @@ process. A failed provider refresh retains that provider's last-good snapshot.
 ## Sealing and rotation
 
 Transient values are XChaCha20-Poly1305 envelopes serialized with postcard. The current 32-byte
-key seals new values. `OAUTHMUX_SEAL_KEY_PREVIOUS` remains accepted during rotation. Key material,
+key seals new values. `OAUTHRELAY_SEAL_KEY_PREVIOUS` remains accepted during rotation. Key material,
 secret material, and envelope plaintext are never logged.
-
-## Unsupported brokered issuer mode
-
-Brokered issuer mode requires oauthmux-owned issuer metadata, signing-key rotation, JWKS,
-downstream token and UserInfo issuance, claims policy, token lifetime policy, and a downstream
-client registry. Configuration under an SSM `brokers` path is rejected until those semantics are
-implemented.

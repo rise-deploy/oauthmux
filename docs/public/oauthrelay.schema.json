@@ -1,14 +1,14 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "ResourceDocument",
-  "description": "A versioned oauthmux configuration resource.",
+  "description": "A versioned oauthrelay configuration resource.",
   "oneOf": [
     {
       "description": "An external OAuth/OIDC provider client and its stable callback.",
       "type": "object",
       "properties": {
         "apiVersion": {
-          "description": "Configuration API version. Must be `oauthmux.dev/v1alpha1`.",
+          "description": "Configuration API version. Must be `oauthrelay.dev/v1alpha1`.",
           "$ref": "#/$defs/ApiVersion"
         },
         "kind": {
@@ -37,7 +37,7 @@
       "type": "object",
       "properties": {
         "apiVersion": {
-          "description": "Configuration API version. Must be `oauthmux.dev/v1alpha1`.",
+          "description": "Configuration API version. Must be `oauthrelay.dev/v1alpha1`.",
           "$ref": "#/$defs/ApiVersion"
         },
         "kind": {
@@ -69,7 +69,7 @@
         {
           "description": "Initial upstream and relay resource API.",
           "type": "string",
-          "const": "oauthmux.dev/v1alpha1"
+          "const": "oauthrelay.dev/v1alpha1"
         }
       ]
     },

@@ -18,9 +18,9 @@ oauth2:
     codeChallengeMethodsSupported: [S256]
 
 staticClients:
-  - id: oauthmux-e2e
-    name: oauthmux E2E
-    secret: oauthmux-e2e-secret
+  - id: oauthrelay-e2e
+    name: oauthrelay E2E
+    secret: oauthrelay-e2e-secret
     redirectURIs:
       - http://127.0.0.1:18080/oidc/upstream/dex/callback
 

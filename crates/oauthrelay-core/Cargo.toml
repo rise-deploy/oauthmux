@@ -1,5 +1,5 @@
 [package]
-name = "oauthmux-core"
+name = "oauthrelay-core"
 description = "Embeddable OAuth/OIDC multiplexing proxy engine"
 version.workspace = true
 edition.workspace = true

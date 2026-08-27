@@ -9,17 +9,17 @@ use serde::Deserialize;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
-/// API version accepted by oauthmux resource documents.
-pub const API_VERSION: &str = "oauthmux.dev/v1alpha1";
+/// API version accepted by oauthrelay resource documents.
+pub const API_VERSION: &str = "oauthrelay.dev/v1alpha1";
 
-/// Returns the JSON Schema for one oauthmux resource document.
+/// Returns the JSON Schema for one oauthrelay resource document.
 pub fn resource_schema() -> schemars::Schema {
     schemars::schema_for!(ResourceDocument)
 }
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
-/// A versioned oauthmux configuration resource.
+/// A versioned oauthrelay configuration resource.
 pub enum ResourceDocument {
     /// An external OAuth/OIDC provider client and its stable callback.
     Upstream(UpstreamResource),
@@ -47,7 +47,7 @@ impl ResourceDocument {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// An external OAuth/OIDC provider connection.
 pub struct UpstreamResource {
-    /// Configuration API version. Must be `oauthmux.dev/v1alpha1`.
+    /// Configuration API version. Must be `oauthrelay.dev/v1alpha1`.
     #[serde(rename = "apiVersion")]
     pub api_version: ApiVersion,
     /// Resource identity.
@@ -60,7 +60,7 @@ pub struct UpstreamResource {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 /// A transparent relay that applies downstream policy to one upstream.
 pub struct RelayResource {
-    /// Configuration API version. Must be `oauthmux.dev/v1alpha1`.
+    /// Configuration API version. Must be `oauthrelay.dev/v1alpha1`.
     #[serde(rename = "apiVersion")]
     pub api_version: ApiVersion,
     /// Resource identity.
@@ -73,7 +73,7 @@ pub struct RelayResource {
 /// Supported configuration API versions.
 pub enum ApiVersion {
     /// Initial upstream and relay resource API.
-    #[serde(rename = "oauthmux.dev/v1alpha1")]
+    #[serde(rename = "oauthrelay.dev/v1alpha1")]
     V1Alpha1,
 }
 
@@ -534,7 +534,7 @@ mod tests {
     #[tokio::test]
     async fn resolves_and_deduplicates_relay_client_secret_references() {
         let source = SecretSource::AwsSsmParameter {
-            name: "/oauthmux/secrets/shared".into(),
+            name: "/oauthrelay/secrets/shared".into(),
         };
         let mut resources = documents(SecretValue::ValueFrom(ReferencedSecret {
             value_from: source.clone(),
@@ -642,19 +642,19 @@ mod tests {
     #[test]
     fn aws_secret_sources_require_cloud_prefixed_keys() {
         assert!(serde_json::from_str::<SecretSource>(
-            r#"{"awsSsmParameter":{"name":"/oauthmux/secrets/google"}}"#
+            r#"{"awsSsmParameter":{"name":"/oauthrelay/secrets/google"}}"#
         )
         .is_ok());
         assert!(serde_json::from_str::<SecretSource>(
-            r#"{"awsSecretsManager":{"secretId":"oauthmux/google","jsonKey":"clientSecret"}}"#
+            r#"{"awsSecretsManager":{"secretId":"oauthrelay/google","jsonKey":"clientSecret"}}"#
         )
         .is_ok());
         assert!(serde_json::from_str::<SecretSource>(
-            r#"{"ssmParameter":{"name":"/oauthmux/secrets/google"}}"#
+            r#"{"ssmParameter":{"name":"/oauthrelay/secrets/google"}}"#
         )
         .is_err());
         assert!(serde_json::from_str::<SecretSource>(
-            r#"{"secretsManager":{"secretId":"oauthmux/google"}}"#
+            r#"{"secretsManager":{"secretId":"oauthrelay/google"}}"#
         )
         .is_err());
     }

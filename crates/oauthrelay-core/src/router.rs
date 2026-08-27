@@ -26,7 +26,7 @@ const CODE_TTL: u64 = 5 * 60;
 const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
 
-pub struct MuxConfig {
+pub struct RelayConfig {
     pub public_url: Url,
     pub sealer: Arc<dyn Sealer>,
     pub replay_cache: Option<Arc<dyn ReplayCache>>,
@@ -46,7 +46,7 @@ pub type KeyMapper = dyn Fn(&[&str]) -> Option<ResourceKey> + Send + Sync;
 #[derive(Clone)]
 struct AppState {
     resolver: Arc<dyn ResourceResolver>,
-    cfg: Arc<MuxConfig>,
+    cfg: Arc<RelayConfig>,
     keys: KeyStrategy,
     cache: Arc<Mutex<HashMap<String, CachedJson>>>,
 }
@@ -125,7 +125,7 @@ enum Endpoint {
     Jwks,
 }
 
-pub fn router(resolver: Arc<dyn ResourceResolver>, cfg: MuxConfig, keys: KeyStrategy) -> Router {
+pub fn router(resolver: Arc<dyn ResourceResolver>, cfg: RelayConfig, keys: KeyStrategy) -> Router {
     let route = public_route_pattern(&cfg.public_url);
     let state = AppState {
         resolver,

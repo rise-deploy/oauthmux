@@ -146,7 +146,8 @@ clientAuthentication:
 
 ### Public
 
-No client secret is accepted. Every authorization-code flow must use S256 PKCE.
+Client authentication credentials are not accepted. `client_id`, when present, is a public
+identifier rather than a credential. Every authorization-code flow must use S256 PKCE.
 
 ```yaml
 clientAuthentication:

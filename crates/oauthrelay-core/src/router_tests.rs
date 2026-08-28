@@ -580,6 +580,44 @@ async fn public_pkce_flow_preserves_upstream_response_and_rejects_replay() {
 }
 
 #[tokio::test]
+async fn public_client_id_is_identification_not_authentication() {
+    let (app, _, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;
+    let verifier = "a-public-verifier-with-enough-entropy-123456789";
+    let code = authorization_code(&app, "google", Some(&pkce_challenge(verifier))).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", "https://app.example/callback"),
+        ("code_verifier", verifier),
+        ("client_id", "public-application"),
+    ])
+    .unwrap();
+
+    assert_eq!(
+        post_token(&app, "google", &form).await.status(),
+        StatusCode::CREATED
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn public_relay_rejects_client_authentication_credentials() {
+    let (app, _, task) = setup("google", ClientAuth::Public, KeyStrategy::SingleSegment).await;
+    let requests = [
+        "grant_type=refresh_token&refresh_token=refresh&client_id=public-application&client_secret=",
+        "grant_type=refresh_token&refresh_token=refresh&client_id=public-application&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion=assertion",
+    ];
+
+    for form in requests {
+        let response = post_token(&app, "google", form).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+        assert_eq!(body["error"], "invalid_client");
+    }
+    task.abort();
+}
+
+#[tokio::test]
 async fn confidential_flow_and_refresh_authenticate_client_secret() {
     let auth = ClientAuth::ClientSecret {
         client_id: "application".into(),

@@ -801,7 +801,16 @@ async fn authenticate(
                 Err(())
             }
         }
-        ClientAuth::Public => Ok(()),
+        ClientAuth::Public => {
+            if form.client_secret.is_none()
+                && form.client_assertion_type.is_none()
+                && form.client_assertion.is_none()
+            {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
         ClientAuth::ClientSecret {
             client_id,
             client_secret,

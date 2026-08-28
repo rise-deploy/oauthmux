@@ -37,6 +37,13 @@ struct MockCapture {
     token: RequestCapture,
 }
 
+#[derive(Clone, Copy)]
+enum EndpointConfiguration {
+    Discovered,
+    Explicit,
+    ExplicitWithoutJwks,
+}
+
 async fn mock_discovery(State(state): State<MockIdpState>) -> Json<Value> {
     Json(json!({
         "issuer": state.base,
@@ -324,7 +331,8 @@ async fn setup(
     auth: ClientAuth,
     strategy: KeyStrategy,
 ) -> (Router, Arc<XChaChaSealer>, tokio::task::JoinHandle<()>) {
-    let (app, sealer, task, _) = setup_with_capture(key, auth, strategy, None, false).await;
+    let (app, sealer, task, _) =
+        setup_with_capture(key, auth, strategy, None, EndpointConfiguration::Discovered).await;
     (app, sealer, task)
 }
 
@@ -333,7 +341,7 @@ async fn setup_with_capture(
     auth: ClientAuth,
     strategy: KeyStrategy,
     allowed_scopes: Option<Vec<String>>,
-    explicit_endpoints: bool,
+    endpoint_configuration: EndpointConfiguration,
 ) -> (
     Router,
     Arc<XChaChaSealer>,
@@ -356,9 +364,14 @@ async fn setup_with_capture(
     let task = tokio::spawn(async move { axum::serve(listener, idp).await.unwrap() });
 
     let key = ResourceKey::new(key).unwrap();
-    let authorization_endpoint = explicit_endpoints.then(|| base.join("authorize").unwrap());
-    let token_endpoint = explicit_endpoints.then(|| base.join("token").unwrap());
-    let jwks_uri = explicit_endpoints.then(|| base.join("jwks").unwrap());
+    let authorization_endpoint =
+        (!matches!(endpoint_configuration, EndpointConfiguration::Discovered))
+            .then(|| base.join("authorize").unwrap());
+    let token_endpoint = authorization_endpoint
+        .as_ref()
+        .map(|_| base.join("token").unwrap());
+    let jwks_uri = matches!(endpoint_configuration, EndpointConfiguration::Explicit)
+        .then(|| base.join("jwks").unwrap());
     let upstream = Arc::new(Upstream {
         key: key.clone(),
         issuer_url: base,
@@ -623,8 +636,14 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
         client_id: "application".into(),
         client_secret: SecretString::new("application-secret"),
     };
-    let (app, _, task, capture) =
-        setup_with_capture("github", auth, KeyStrategy::SingleSegment, None, false).await;
+    let (app, _, task, capture) = setup_with_capture(
+        "github",
+        auth,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::Discovered,
+    )
+    .await;
     let code = authorization_code(&app, "github", None).await;
     let form = serde_urlencoded::to_string([
         ("grant_type", "authorization_code"),
@@ -879,7 +898,7 @@ async fn authorization_relay_preserves_extensions_and_applies_scope_policy() {
         ClientAuth::Public,
         KeyStrategy::SingleSegment,
         Some(vec!["openid".into(), "email".into()]),
-        false,
+        EndpointConfiguration::Discovered,
     )
     .await;
     let request = format!(
@@ -1195,7 +1214,7 @@ async fn explicit_endpoints_produce_transparent_relay_metadata() {
         ClientAuth::Public,
         KeyStrategy::SingleSegment,
         None,
-        true,
+        EndpointConfiguration::Explicit,
     )
     .await;
     let response = app
@@ -1219,6 +1238,46 @@ async fn explicit_endpoints_produce_transparent_relay_metadata() {
         "https://relay.example/relay/google/token"
     );
     assert_eq!(value["jwks_uri"], format!("{issuer}/jwks"));
+    task.abort();
+}
+
+#[tokio::test]
+async fn discovery_supplies_jwks_when_other_endpoints_are_explicit() {
+    let (app, _, task, _) = setup_with_capture(
+        "google",
+        ClientAuth::Public,
+        KeyStrategy::SingleSegment,
+        None,
+        EndpointConfiguration::ExplicitWithoutJwks,
+    )
+    .await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get("/relay/google/.well-known/openid-configuration")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+    let issuer = value["issuer"].as_str().unwrap();
+    assert_eq!(value["jwks_uri"], format!("{issuer}jwks"));
+
+    let jwks = app
+        .oneshot(
+            Request::get("/relay/google/jwks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(jwks.status(), StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&response_body(jwks).await).unwrap(),
+        json!({ "keys": [] })
+    );
     task.abort();
 }
 

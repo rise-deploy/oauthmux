@@ -77,9 +77,9 @@ https://login.example.com/oidc/upstream/google/callback
 Here `OAUTHRELAY_PUBLIC_URL` is `https://login.example.com/oidc`. Set it to another path, such as
 `https://login.example.com/services/oauthrelay`, to serve the same API under that path instead.
 
-Explicit endpoints are useful for providers without standard discovery. When authorization or
-token is omitted, oauthrelay reads `{issuerUrl}/.well-known/openid-configuration`. The issuer and
-JWKS remain upstream-owned by the relay contract.
+Explicit endpoints are useful for providers without standard discovery. Each omitted endpoint is
+resolved from `{issuerUrl}/.well-known/openid-configuration`. The issuer and JWKS remain
+upstream-owned by the relay contract.
 
 ## Relay
 

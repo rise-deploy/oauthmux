@@ -896,8 +896,7 @@ async fn verify_private_key_jwt(
 
 async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Response {
     let discovery = discovery_url(&upstream.issuer_url);
-    let mut doc = if upstream.authorization_endpoint.is_some() && upstream.token_endpoint.is_some()
-    {
+    let mut doc = if !needs_endpoint_discovery(upstream) {
         json!({})
     } else {
         match cached_json(state, &discovery, DISCOVERY_TTL).await {
@@ -934,11 +933,11 @@ async fn discovery(state: &AppState, relay: &Relay, upstream: &Upstream) -> Resp
 }
 
 async fn jwks(state: &AppState, upstream: &Upstream) -> Response {
-    let endpoints = match resolve_endpoints(state, upstream).await {
+    let url = match resolve_jwks_uri(state, upstream).await {
         Ok(value) => value,
         Err(status) => return status.into_response(),
     };
-    let Some(url) = endpoints.jwks_uri else {
+    let Some(url) = url else {
         return StatusCode::NOT_FOUND.into_response();
     };
     match cached_json(state, &url, JWKS_TTL).await {
@@ -964,31 +963,52 @@ async fn resolve_endpoints(
     resolve_endpoints_from_doc(upstream, &doc)
 }
 
+async fn resolve_jwks_uri(
+    state: &AppState,
+    upstream: &Upstream,
+) -> Result<Option<Url>, StatusCode> {
+    if upstream.jwks_uri.is_some() {
+        return Ok(upstream.jwks_uri.clone());
+    }
+    let doc = cached_json(state, &discovery_url(&upstream.issuer_url), DISCOVERY_TTL).await?;
+    Ok(url_field(&doc, "jwks_uri"))
+}
+
+fn needs_endpoint_discovery(upstream: &Upstream) -> bool {
+    upstream.authorization_endpoint.is_none()
+        || upstream.token_endpoint.is_none()
+        || upstream.jwks_uri.is_none()
+}
+
 fn resolve_endpoints_from_doc(
     upstream: &Upstream,
     doc: &Value,
 ) -> Result<ResolvedEndpoints, StatusCode> {
-    let url_field = |name: &str| {
-        doc.get(name)
-            .and_then(Value::as_str)
-            .and_then(|s| Url::parse(s).ok())
-    };
     let authorization_endpoint = upstream
         .authorization_endpoint
         .clone()
-        .or_else(|| url_field("authorization_endpoint"))
+        .or_else(|| url_field(doc, "authorization_endpoint"))
         .ok_or(StatusCode::BAD_GATEWAY)?;
     let token_endpoint = upstream
         .token_endpoint
         .clone()
-        .or_else(|| url_field("token_endpoint"))
+        .or_else(|| url_field(doc, "token_endpoint"))
         .ok_or(StatusCode::BAD_GATEWAY)?;
-    let jwks_uri = upstream.jwks_uri.clone().or_else(|| url_field("jwks_uri"));
+    let jwks_uri = upstream
+        .jwks_uri
+        .clone()
+        .or_else(|| url_field(doc, "jwks_uri"));
     Ok(ResolvedEndpoints {
         authorization_endpoint,
         token_endpoint,
         jwks_uri,
     })
+}
+
+fn url_field(doc: &Value, name: &str) -> Option<Url> {
+    doc.get(name)
+        .and_then(Value::as_str)
+        .and_then(|value| Url::parse(value).ok())
 }
 
 async fn cached_json(state: &AppState, url: &Url, ttl: Duration) -> Result<Value, StatusCode> {

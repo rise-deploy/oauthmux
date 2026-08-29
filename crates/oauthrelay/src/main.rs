@@ -434,11 +434,16 @@ fn parse_duration(name: &str, value: &str) -> anyhow::Result<Duration> {
         (value, 1_000)
     } else if let Some(value) = value.strip_suffix('m') {
         (value, 60_000)
+    } else if let Some(value) = value.strip_suffix('h') {
+        (value, 3_600_000)
     } else {
-        return Err(anyhow!("{name} must use ms, s, or m units"));
+        return Err(anyhow!("{name} must use ms, s, m, or h units"));
     };
     let millis: u64 = number.parse().with_context(|| format!("invalid {name}"))?;
-    let duration = Duration::from_millis(millis.saturating_mul(multiplier));
+    let millis = millis
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("{name} is too large"))?;
+    let duration = Duration::from_millis(millis);
     if duration.is_zero() {
         return Err(anyhow!("{name} must be greater than zero"));
     }
@@ -541,12 +546,45 @@ mod tests {
     }
 
     #[test]
-    fn durations_require_units_and_positive_values() {
+    fn durations_support_documented_units() {
+        assert_eq!(
+            parse_duration("TEST", "1ms").unwrap(),
+            Duration::from_millis(1)
+        );
         assert_eq!(
             parse_duration("TEST", "2s").unwrap(),
             Duration::from_secs(2)
         );
+        assert_eq!(
+            parse_duration("TEST", "3m").unwrap(),
+            Duration::from_secs(3 * 60)
+        );
+        assert_eq!(
+            parse_duration("TEST", "1h").unwrap(),
+            Duration::from_secs(60 * 60)
+        );
+    }
+
+    #[test]
+    fn durations_require_units_and_positive_integer_values() {
         assert!(parse_duration("TEST", "0s").is_err());
+        assert!(parse_duration("TEST", "1").is_err());
+        assert!(parse_duration("TEST", "1d").is_err());
+        assert!(parse_duration("TEST", "1.5h").is_err());
+    }
+
+    #[test]
+    fn durations_reject_millisecond_overflow() {
+        let largest_hours = u64::MAX / 3_600_000;
+        assert_eq!(
+            parse_duration("TEST", &format!("{largest_hours}h")).unwrap(),
+            Duration::from_millis(largest_hours * 3_600_000)
+        );
+        assert!(parse_duration("TEST", &format!("{}h", largest_hours + 1)).is_err());
+    }
+
+    #[test]
+    fn booleans_accept_only_rust_boolean_literals() {
         assert!(parse_bool("TEST", "true").unwrap());
         assert!(!parse_bool("TEST", "false").unwrap());
         assert!(parse_bool("TEST", "yes").is_err());

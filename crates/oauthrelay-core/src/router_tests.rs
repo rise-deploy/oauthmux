@@ -599,6 +599,8 @@ async fn public_pkce_flow_preserves_upstream_response_and_rejects_replay() {
         response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
         "https://app.example"
     );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.headers()[header::PRAGMA], "no-cache");
     assert!(String::from_utf8(response_body(response).await)
         .unwrap()
         .contains("access"));
@@ -682,6 +684,8 @@ async fn confidential_flow_and_refresh_authenticate_client_secret() {
         response.headers()[header::CONTENT_TYPE],
         "application/vnd.oauth-refresh+json"
     );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(response.headers()[header::PRAGMA], "no-cache");
     let upstream_refresh = capture.token.lock().unwrap().last().unwrap().clone();
     assert!(upstream_refresh
         .iter()

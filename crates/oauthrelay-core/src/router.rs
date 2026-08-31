@@ -15,7 +15,7 @@ use jsonwebtoken::{decode, decode_header, jwk::JwkSet, Algorithm, DecodingKey, V
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
@@ -25,6 +25,7 @@ const FLOW_TTL: u64 = 10 * 60;
 const CODE_TTL: u64 = 5 * 60;
 const DISCOVERY_TTL: Duration = Duration::from_secs(60 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(10 * 60);
+const ID_TOKEN_CLOCK_SKEW: u64 = 60;
 
 pub struct RelayConfig {
     pub public_url: Url,
@@ -65,6 +66,7 @@ struct FlowEnvelope {
     upstream_pkce_verifier: String,
     client_code_challenge: Option<String>,
     client_code_challenge_method: Option<String>,
+    id_token_nonce: Option<String>,
     issued_at: u64,
     nonce: [u8; 16],
 }
@@ -76,6 +78,7 @@ struct CodeEnvelope {
     issued_at: u64,
     redirect_uri: String,
     client_code_challenge: Option<String>,
+    id_token_nonce: Option<String>,
     upstream_response: StoredResponse,
 }
 
@@ -91,6 +94,7 @@ struct AuthorizeRequest {
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
+    id_token_nonce: Option<String>,
     scope: Option<String>,
     forwarded: Vec<(String, String)>,
 }
@@ -274,6 +278,7 @@ fn parse_authorize_request(uri: &Uri) -> Result<AuthorizeRequest, ()> {
     let mut state = None;
     let mut code_challenge = None;
     let mut code_challenge_method = None;
+    let mut id_token_nonce = None;
     let mut scope = None;
     let mut forwarded = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -309,6 +314,10 @@ fn parse_authorize_request(uri: &Uri) -> Result<AuthorizeRequest, ()> {
             "code_challenge" => code_challenge = Some(value),
             "code_challenge_method" => code_challenge_method = Some(value),
             "scope" => scope = Some(value),
+            "nonce" => {
+                id_token_nonce = Some(value.clone());
+                forwarded.push((name, value));
+            }
             "request" | "request_uri" => return Err(()),
             _ => forwarded.push((name, value)),
         }
@@ -319,6 +328,7 @@ fn parse_authorize_request(uri: &Uri) -> Result<AuthorizeRequest, ()> {
         state,
         code_challenge,
         code_challenge_method,
+        id_token_nonce,
         scope,
         forwarded,
     })
@@ -467,6 +477,7 @@ async fn authorize(
         upstream_pkce_verifier: verifier.clone(),
         client_code_challenge_method: query.code_challenge.as_ref().map(|_| "S256".to_owned()),
         client_code_challenge: query.code_challenge,
+        id_token_nonce: query.id_token_nonce,
         issued_at: unix_now(),
         nonce: random_array(),
     };
@@ -559,6 +570,7 @@ async fn callback(state: &AppState, upstream: &Upstream, query: CallbackRequest)
         issued_at: unix_now(),
         redirect_uri: flow.app_redirect_uri,
         client_code_challenge: flow.client_code_challenge,
+        id_token_nonce: flow.id_token_nonce,
         upstream_response: StoredResponse {
             status,
             content_type,
@@ -636,7 +648,7 @@ async fn token(
         );
     }
     let response = match form.grant_type.as_str() {
-        "authorization_code" => exchange_sealed_code(state, relay, &form).await,
+        "authorization_code" => exchange_sealed_code(state, relay, upstream, &form).await,
         "refresh_token" => refresh(state, relay, upstream, &form).await,
         _ => oauth_error(
             StatusCode::BAD_REQUEST,
@@ -647,7 +659,12 @@ async fn token(
     with_cors(response, origin)
 }
 
-async fn exchange_sealed_code(state: &AppState, relay: &Relay, form: &TokenRequest) -> Response {
+async fn exchange_sealed_code(
+    state: &AppState,
+    relay: &Relay,
+    upstream: &Upstream,
+    form: &TokenRequest,
+) -> Response {
     let Some(code) = &form.code else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -703,6 +720,21 @@ async fn exchange_sealed_code(state: &AppState, relay: &Relay, form: &TokenReque
             "PKCE challenge is missing",
         );
     }
+    let validation = validate_required_id_token_claims(
+        state,
+        relay,
+        upstream,
+        &envelope.upstream_response,
+        envelope.id_token_nonce.as_deref(),
+    )
+    .await;
+    if validation == Err(IdTokenValidationError::Unavailable) {
+        return oauth_error(
+            StatusCode::BAD_GATEWAY,
+            "server_error",
+            "ID token validation is unavailable",
+        );
+    }
     if let Some(cache) = &state.cfg.replay_cache {
         let id = URL_SAFE_NO_PAD.encode(envelope.envelope_id);
         match cache.first_use(&id, Duration::from_secs(CODE_TTL)).await {
@@ -716,7 +748,151 @@ async fn exchange_sealed_code(state: &AppState, relay: &Relay, form: &TokenReque
             }
         }
     }
+    if validation == Err(IdTokenValidationError::Rejected) {
+        return required_claims_error();
+    }
     stored_response(envelope.upstream_response)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdTokenValidationError {
+    Rejected,
+    Unavailable,
+}
+
+async fn validate_required_id_token_claims(
+    state: &AppState,
+    relay: &Relay,
+    upstream: &Upstream,
+    response: &StoredResponse,
+    expected_nonce: Option<&str>,
+) -> Result<(), IdTokenValidationError> {
+    if relay.required_id_token_claims.is_empty()
+        || !StatusCode::from_u16(response.status).is_ok_and(|status| status.is_success())
+    {
+        return Ok(());
+    }
+
+    let token_response: Value =
+        serde_json::from_slice(&response.body).map_err(|_| IdTokenValidationError::Rejected)?;
+    let id_token = token_response
+        .get("id_token")
+        .and_then(Value::as_str)
+        .ok_or(IdTokenValidationError::Rejected)?;
+    let header = decode_header(id_token).map_err(|_| IdTokenValidationError::Rejected)?;
+    if !matches!(
+        header.alg,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512
+            | Algorithm::ES256
+            | Algorithm::ES384
+    ) {
+        return Err(IdTokenValidationError::Rejected);
+    }
+
+    let jwks_uri = resolve_jwks_uri(state, upstream)
+        .await
+        .map_err(|_| IdTokenValidationError::Unavailable)?
+        .ok_or(IdTokenValidationError::Unavailable)?;
+    let value = cached_json(state, &jwks_uri, JWKS_TTL)
+        .await
+        .map_err(|_| IdTokenValidationError::Unavailable)?;
+    let set: JwkSet =
+        serde_json::from_value(value).map_err(|_| IdTokenValidationError::Unavailable)?;
+    let jwk = match header.kid.as_deref() {
+        Some(kid) => set
+            .keys
+            .iter()
+            .find(|key| key.common.key_id.as_deref() == Some(kid)),
+        None if set.keys.len() == 1 => set.keys.first(),
+        _ => None,
+    }
+    .ok_or(IdTokenValidationError::Rejected)?;
+    let key = DecodingKey::from_jwk(jwk).map_err(|_| IdTokenValidationError::Rejected)?;
+    let issuer = issuer_identifier(&upstream.issuer_url);
+    let mut validation = Validation::new(header.alg);
+    validation.set_issuer(&[issuer.as_str()]);
+    validation.set_audience(&[upstream.client_id.as_str()]);
+    validation.set_required_spec_claims(&["iss", "sub", "aud", "exp", "iat"]);
+    validation.validate_nbf = true;
+    let claims = decode::<Value>(id_token, &key, &validation)
+        .map_err(|_| IdTokenValidationError::Rejected)?
+        .claims;
+
+    let issued_at = claims.get("iat").and_then(Value::as_u64);
+    if !claims
+        .get("sub")
+        .and_then(Value::as_str)
+        .is_some_and(|subject| !subject.is_empty())
+        || issued_at.is_none_or(|issued_at| issued_at > unix_now() + ID_TOKEN_CLOCK_SKEW)
+        || expected_nonce
+            .is_some_and(|expected| claims.get("nonce").and_then(Value::as_str) != Some(expected))
+        || !valid_authorized_party(&claims, &upstream.client_id)
+        || !valid_access_token_hash(&claims, &token_response, header.alg)
+    {
+        return Err(IdTokenValidationError::Rejected);
+    }
+
+    if relay
+        .required_id_token_claims
+        .iter()
+        .all(|(name, expected)| claims.get(name).and_then(Value::as_str) == Some(expected))
+    {
+        Ok(())
+    } else {
+        Err(IdTokenValidationError::Rejected)
+    }
+}
+
+fn issuer_identifier(url: &Url) -> String {
+    if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
+        url.as_str().trim_end_matches('/').to_owned()
+    } else {
+        url.to_string()
+    }
+}
+
+fn valid_authorized_party(claims: &Value, client_id: &str) -> bool {
+    let multiple_audiences = claims
+        .get("aud")
+        .and_then(Value::as_array)
+        .is_some_and(|audiences| audiences.len() > 1);
+    match claims.get("azp") {
+        Some(value) => value.as_str() == Some(client_id),
+        None => !multiple_audiences,
+    }
+}
+
+fn valid_access_token_hash(claims: &Value, token_response: &Value, algorithm: Algorithm) -> bool {
+    let Some(actual) = claims.get("at_hash") else {
+        return true;
+    };
+    let Some(actual) = actual.as_str() else {
+        return false;
+    };
+    let Some(access_token) = token_response.get("access_token").and_then(Value::as_str) else {
+        return false;
+    };
+    let expected = match algorithm {
+        Algorithm::RS256 | Algorithm::PS256 | Algorithm::ES256 => {
+            let digest = Sha256::digest(access_token.as_bytes());
+            URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }
+        Algorithm::RS384 | Algorithm::PS384 | Algorithm::ES384 => {
+            let digest = Sha384::digest(access_token.as_bytes());
+            URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }
+        Algorithm::RS512 | Algorithm::PS512 => {
+            let digest = Sha512::digest(access_token.as_bytes());
+            URL_SAFE_NO_PAD.encode(&digest[..digest.len() / 2])
+        }
+        _ => return false,
+    };
+    constant_eq(actual.as_bytes(), expected.as_bytes())
 }
 
 async fn refresh(
@@ -1115,6 +1291,21 @@ fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
         Json(json!({ "error": error, "error_description": description })),
     )
         .into_response()
+}
+
+fn required_claims_error() -> Response {
+    let mut response = oauth_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "Identity does not satisfy required ID-token claims.",
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
 }
 
 fn found(location: &str) -> Response {

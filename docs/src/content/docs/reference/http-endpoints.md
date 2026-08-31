@@ -10,7 +10,7 @@ upstream name `U`, oauthrelay serves:
 | --- | --- |
 | `GET {B}/relay/{R}/authorize` | Validates redirect and scope policy, creates independent upstream state and S256 PKCE, then redirects to the upstream. |
 | `GET {B}/upstream/{U}/callback` | Validates upstream-bound state, exchanges the upstream code, and returns a sealed code to the originating relay redirect. |
-| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, and PKCE, then returns the stored upstream response unchanged. |
+| `POST {B}/relay/{R}/token` | Authenticates the relying party, validates the sealed code, redirect, PKCE, and configured ID-token claims, then returns the stored upstream response unchanged. |
 | `POST {B}/relay/{R}/token` with `refresh_token` | Authenticates the relying party and relays the refresh grant with upstream credentials. |
 | `OPTIONS {B}/relay/{R}/token` | Returns CORS headers only for an allowed origin. |
 | `GET {B}/relay/{R}/.well-known/openid-configuration` | Preserves upstream issuer/JWKS metadata and rewrites authorization and token endpoints to the relay. |
@@ -48,6 +48,11 @@ application.
 The authorization-code request must use the same redirect URI and, when present, the matching PKCE
 verifier. Successful exchange returns the upstream status, content type, and body bytes unchanged.
 The standalone replay cache rejects a second use in the same process.
+
+When `requiredIdTokenClaims` is non-empty, oauthrelay verifies the signed upstream ID token before
+returning a successful stored response. A missing or different claim returns HTTP 400 with
+`error=invalid_grant`, a generic description, and `no-store`/`no-cache` response headers. The
+response does not include tokens or rejected claim values.
 
 Refresh grants preserve extension fields and replace downstream authentication with the referenced
 upstream client credentials. Unsupported grants and invalid requests use RFC 6749-style JSON error

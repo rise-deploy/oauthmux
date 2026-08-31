@@ -132,6 +132,9 @@ pub struct RelayResourceSpec {
     /// Default and allowed upstream scopes.
     #[serde(default)]
     pub scopes: ScopePolicy,
+    /// Exact string values required in the verified upstream ID token.
+    #[serde(default)]
+    pub required_id_token_claims: HashMap<String, String>,
     /// Authentication required at the relay token endpoint.
     pub client_authentication: ClientAuthentication,
     /// Explicit application redirect matchers.
@@ -403,6 +406,7 @@ pub async fn compile_resources(
             client_auth,
             scopes: resource.spec.scopes.default,
             allowed_scopes: resource.spec.scopes.allowed,
+            required_id_token_claims: resource.spec.required_id_token_claims,
             redirect_policy,
         };
         relay
@@ -501,6 +505,7 @@ mod tests {
                         name: "google".into(),
                     },
                     scopes: ScopePolicy::default(),
+                    required_id_token_claims: HashMap::new(),
                     client_authentication: ClientAuthentication::UpstreamClient,
                     redirect_policy: vec![RedirectPolicyEntry::Uri(UriRedirectPolicy {
                         uri: "https://app.example/callback".into(),
@@ -518,16 +523,25 @@ mod tests {
         let secrets = MockSecrets {
             calls: Mutex::new(vec![]),
         };
-        let snapshot = compile_resources(
-            documents(SecretValue::ValueFrom(ReferencedSecret {
-                value_from: source.clone(),
-            })),
-            &secrets,
-        )
-        .await
-        .unwrap();
+        let mut resources = documents(SecretValue::ValueFrom(ReferencedSecret {
+            value_from: source.clone(),
+        }));
+        let ResourceDocument::Relay(relay) = &mut resources[1] else {
+            unreachable!();
+        };
+        relay.spec.required_id_token_claims = HashMap::from([("hd".into(), "example.com".into())]);
+        let snapshot = compile_resources(resources, &secrets).await.unwrap();
         assert_eq!(snapshot.upstreams.len(), 1);
         assert_eq!(snapshot.relays.len(), 1);
+        assert_eq!(
+            snapshot
+                .relays
+                .values()
+                .next()
+                .unwrap()
+                .required_id_token_claims,
+            HashMap::from([("hd".into(), "example.com".into())])
+        );
         assert_eq!(*secrets.calls.lock().unwrap(), vec![source]);
     }
 
@@ -635,6 +649,7 @@ mod tests {
         assert!(schema.contains("awsSsmParameter"));
         assert!(schema.contains("awsSecretsManager"));
         assert!(schema.contains("jsonKey"));
+        assert!(schema.contains("requiredIdTokenClaims"));
         assert!(schema.contains("stable callback"));
         assert!(schema.contains("complete redirect URI exactly"));
     }

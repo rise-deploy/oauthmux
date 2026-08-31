@@ -232,7 +232,8 @@ impl Relay {
                 validate_loopback_uri(value).is_ok()
                     && url.scheme() == "http"
                     && loopback_host_matches(&base, &url, allow_localhost_loopback)
-                    && raw_path_and_query(value) == raw_path_and_query(redirect)
+                    && raw_path_and_query(value)
+                        .is_some_and(|tail| raw_path_and_query(redirect) == Some(tail))
             }),
         })
     }
@@ -357,8 +358,12 @@ fn validate_loopback_uri(value: &str) -> Result<(), String> {
 }
 
 fn validate_raw_uri(value: &str) -> Result<(), String> {
-    if !value.is_ascii() || value.bytes().any(|byte| byte.is_ascii_whitespace()) {
-        return Err("must use an ASCII URI without whitespace".into());
+    if !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte == b'\\')
+    {
+        return Err("must use an ASCII URI without whitespace or backslashes".into());
     }
     Ok(())
 }
@@ -404,14 +409,13 @@ fn loopback_host_matches(base: &Url, candidate: &Url, allow_localhost: bool) -> 
             && matches!(candidate.host(), Some(Host::Domain(domain)) if domain.eq_ignore_ascii_case("localhost")))
 }
 
-fn raw_path_and_query(value: &str) -> &str {
-    let authority = value
-        .split_once("://")
-        .expect("validated absolute redirect URI")
-        .1;
-    authority
-        .find(['/', '?'])
-        .map_or("", |index| &authority[index..])
+fn raw_path_and_query(value: &str) -> Option<&str> {
+    let authority = value.split_once("://")?.1;
+    Some(
+        authority
+            .find(['/', '?'])
+            .map_or("", |index| &authority[index..]),
+    )
 }
 
 pub(crate) fn valid_scope_token(scope: &str) -> bool {
@@ -480,6 +484,9 @@ mod tests {
         };
         assert!(!normalized_path.redirect_allowed("http://127.0.0.1:49152/callback", false));
         for bad in [
+            "http://127.0.0.1:49152\\evil/oauth/callback?source=cli",
+            "http://127.0.0.1:49152\\@evil.test/oauth/callback?source=cli",
+            "http:/127.0.0.1/oauth/callback?source=cli",
             "https://preview.example.com.evil.test/cb",
             "https://preview.example.com@evil.test/cb",
             "http://preview.example.com/cb",
@@ -507,6 +514,8 @@ mod tests {
         assert!(RedirectMatcher::loopback("http://127.0.0.1:8080/callback").is_err());
         assert!(RedirectMatcher::loopback("http://127.0.0.2/callback").is_err());
         assert!(RedirectMatcher::loopback("http://localhost/callback").is_err());
+        assert!(RedirectMatcher::loopback("http://127.0.0.1/cb\\x").is_err());
+        assert!(RedirectMatcher::uri("https://app.example/cb\\x").is_err());
     }
 
     #[test]

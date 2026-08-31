@@ -1225,7 +1225,10 @@ async fn proxy_response(response: reqwest::Response) -> Response {
         Ok(body) => body,
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
-    let mut response = Response::builder().status(status);
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .header(header::PRAGMA, HeaderValue::from_static("no-cache"));
     if let Some(content_type) = content_type {
         response = response.header(header::CONTENT_TYPE, content_type);
     }
@@ -1234,7 +1237,10 @@ async fn proxy_response(response: reqwest::Response) -> Response {
 
 fn stored_response(stored: StoredResponse) -> Response {
     let status = StatusCode::from_u16(stored.status).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut response = Response::builder().status(status);
+    let mut response = Response::builder()
+        .status(status)
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))
+        .header(header::PRAGMA, HeaderValue::from_static("no-cache"));
     if let Some(content_type) = stored.content_type {
         if let Ok(value) = HeaderValue::from_str(&content_type) {
             response = response.header(header::CONTENT_TYPE, value);

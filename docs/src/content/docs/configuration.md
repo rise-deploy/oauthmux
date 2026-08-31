@@ -125,8 +125,8 @@ fixed. `localhost` is not a loopback IP literal; the off-by-default
 `OAUTHRELAY_ALLOW_LOCALHOST_LOOPBACK` service option treats it as an alias for a matching IP-literal
 loopback entry.
 
-User information, fragments, wildcards, prefix matching, empty policies, duplicate entries, and
-entries containing more than one matcher are rejected.
+User information, fragments, wildcards, prefix matching, empty policies, duplicate entries,
+backslashes, and entries containing more than one matcher are rejected.
 
 The token endpoint derives CORS permission without broadening redirects. A `uri` entry permits its
 origin, an `origin` entry permits that origin, and a `loopback` entry permits its IP host on any

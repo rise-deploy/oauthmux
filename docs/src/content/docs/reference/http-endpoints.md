@@ -46,8 +46,9 @@ application.
 ## Token endpoint
 
 The authorization-code request must use the same redirect URI and, when present, the matching PKCE
-verifier. Successful exchange returns the upstream status, content type, and body bytes unchanged.
-The standalone replay cache rejects a second use in the same process.
+verifier. Successful exchange returns the upstream status, content type, and body bytes unchanged
+under `no-store`/`no-cache` response headers. The standalone replay cache rejects a second use in
+the same process.
 
 When `requiredIdTokenClaims` is non-empty, oauthrelay verifies the signed upstream ID token before
 returning a successful stored response. A missing or different claim returns HTTP 400 with

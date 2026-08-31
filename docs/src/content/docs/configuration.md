@@ -36,7 +36,7 @@ spec:
     default: [openid, email, profile]
     allowed: [openid, email, profile]
   requiredIdTokenClaims:
-    hd: baliohq.com
+    hd: example.com
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:

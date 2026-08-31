@@ -19,7 +19,10 @@ use rsa::{
     traits::PublicKeyParts,
     RsaPrivateKey,
 };
-use std::sync::Mutex as StdMutex;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex as StdMutex,
+};
 use tower::ServiceExt;
 
 type FormPairs = Vec<(String, String)>;
@@ -118,6 +121,7 @@ struct SignedFixtureState {
     issuer: String,
     private_pem: Arc<String>,
     jwks: Value,
+    jwks_failures_remaining: Arc<AtomicUsize>,
     nonce: Arc<StdMutex<Option<String>>>,
     authorize: Arc<StdMutex<Vec<(String, String)>>>,
 }
@@ -217,8 +221,17 @@ async fn signed_token(State(state): State<SignedFixtureState>, body: String) -> 
     .into_response()
 }
 
-async fn signed_jwks(State(state): State<SignedFixtureState>) -> Json<Value> {
-    Json(state.jwks)
+async fn signed_jwks(State(state): State<SignedFixtureState>) -> Response {
+    if state
+        .jwks_failures_remaining
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            remaining.checked_sub(1)
+        })
+        .is_ok()
+    {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    Json(state.jwks).into_response()
 }
 
 async fn signed_userinfo(headers: HeaderMap) -> Response {
@@ -271,6 +284,7 @@ async fn setup_signed_profile(
         issuer,
         private_pem: Arc::new(private_pem),
         jwks,
+        jwks_failures_remaining: Arc::new(AtomicUsize::new(0)),
         nonce: Arc::new(StdMutex::new(None)),
         authorize: Arc::new(StdMutex::new(Vec::new())),
     };
@@ -1103,6 +1117,39 @@ async fn required_id_token_claims_accept_exact_strings_and_reject_missing_or_mis
         }
         task.abort();
     }
+}
+
+#[tokio::test]
+async fn transient_id_token_validation_failure_does_not_consume_the_relay_code() {
+    let (app, fixture, task, redirect_uri, _) = setup_signed_profile(
+        RelayProfile::Google,
+        HashMap::from([("hd".into(), "example.com".into())]),
+    )
+    .await;
+    fixture.jwks_failures_remaining.store(1, Ordering::SeqCst);
+    let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+    let form = serde_urlencoded::to_string([
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("code_verifier", verifier.as_str()),
+    ])
+    .unwrap();
+
+    let unavailable = post_token(&app, "profile", &form).await;
+    assert_eq!(unavailable.status(), StatusCode::BAD_GATEWAY);
+    let unavailable_body: Value =
+        serde_json::from_slice(&response_body(unavailable).await).unwrap();
+    assert_eq!(unavailable_body["error"], "server_error");
+
+    let retry = post_token(&app, "profile", &form).await;
+    assert_eq!(retry.status(), StatusCode::OK);
+
+    let replay = post_token(&app, "profile", &form).await;
+    assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+    let replay_body: Value = serde_json::from_slice(&response_body(replay).await).unwrap();
+    assert_eq!(replay_body["error_description"], "code was already used");
+    task.abort();
 }
 
 async fn run_signed_relay_profile(profile: RelayProfile) {

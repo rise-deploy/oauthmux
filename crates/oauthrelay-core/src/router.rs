@@ -720,6 +720,21 @@ async fn exchange_sealed_code(
             "PKCE challenge is missing",
         );
     }
+    let validation = validate_required_id_token_claims(
+        state,
+        relay,
+        upstream,
+        &envelope.upstream_response,
+        envelope.id_token_nonce.as_deref(),
+    )
+    .await;
+    if validation == Err(IdTokenValidationError::Unavailable) {
+        return oauth_error(
+            StatusCode::BAD_GATEWAY,
+            "server_error",
+            "ID token validation is unavailable",
+        );
+    }
     if let Some(cache) = &state.cfg.replay_cache {
         let id = URL_SAFE_NO_PAD.encode(envelope.envelope_id);
         match cache.first_use(&id, Duration::from_secs(CODE_TTL)).await {
@@ -733,24 +748,8 @@ async fn exchange_sealed_code(
             }
         }
     }
-    match validate_required_id_token_claims(
-        state,
-        relay,
-        upstream,
-        &envelope.upstream_response,
-        envelope.id_token_nonce.as_deref(),
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(IdTokenValidationError::Rejected) => return required_claims_error(),
-        Err(IdTokenValidationError::Unavailable) => {
-            return oauth_error(
-                StatusCode::BAD_GATEWAY,
-                "server_error",
-                "ID token validation is unavailable",
-            )
-        }
+    if validation == Err(IdTokenValidationError::Rejected) {
+        return required_claims_error();
     }
     stored_response(envelope.upstream_response)
 }

@@ -1,5 +1,11 @@
 use serde::{Deserialize, Deserializer, Serialize};
-use std::{collections::HashSet, fmt, net::Ipv4Addr, str::FromStr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    net::Ipv4Addr,
+    str::FromStr,
+    sync::Arc,
+};
 use url::{Host, Url};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -114,6 +120,8 @@ pub struct Relay {
     pub client_auth: ClientAuth,
     pub scopes: Vec<String>,
     pub allowed_scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub required_id_token_claims: HashMap<String, String>,
     pub redirect_policy: Vec<RedirectMatcher>,
 }
 
@@ -250,6 +258,13 @@ impl Relay {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .required_id_token_claims
+            .keys()
+            .any(|claim| claim.is_empty())
+        {
+            return Err("required_id_token_claims must not contain an empty claim name".into());
+        }
         let mut configured_scopes = HashSet::new();
         for scope in &self.scopes {
             if !valid_scope_token(scope) {
@@ -430,6 +445,7 @@ mod tests {
             client_auth: ClientAuth::Public,
             scopes: vec![],
             allowed_scopes: None,
+            required_id_token_claims: HashMap::new(),
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb?channel=stable&next=%2Fhome")
                     .unwrap(),
@@ -501,6 +517,7 @@ mod tests {
             client_auth: ClientAuth::Public,
             scopes: vec![],
             allowed_scopes: None,
+            required_id_token_claims: HashMap::new(),
             redirect_policy: vec![
                 RedirectMatcher::uri("https://exact.example/cb").unwrap(),
                 RedirectMatcher::origin("https://preview.example").unwrap(),

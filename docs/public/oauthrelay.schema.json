@@ -275,6 +275,14 @@
           },
           "minItems": 1
         },
+        "requiredIdTokenClaims": {
+          "description": "Exact string values required in the verified upstream ID token.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
         "scopes": {
           "description": "Default and allowed upstream scopes.",
           "$ref": "#/$defs/ScopePolicy"

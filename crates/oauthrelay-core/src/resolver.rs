@@ -180,6 +180,7 @@ mod tests {
             client_auth: ClientAuth::Public,
             scopes: vec![],
             allowed_scopes: None,
+            required_id_token_claims: HashMap::new(),
             redirect_policy: vec![RedirectMatcher::uri("https://app.example/callback").unwrap()],
         })
     }

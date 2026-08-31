@@ -35,6 +35,8 @@ spec:
   scopes:
     default: [openid, email, profile]
     allowed: [openid, email, profile]
+  requiredIdTokenClaims:
+    hd: baliohq.com
   clientAuthentication:
     type: UpstreamClient
   redirectPolicy:
@@ -88,6 +90,7 @@ upstream-owned by the relay contract.
 | `spec.upstreamRef.name` | yes | — | Existing upstream used for authorization and token exchange. |
 | `spec.scopes.default` | no | `[]` | Scopes used when the authorization request omits `scope`. |
 | `spec.scopes.allowed` | no | unrestricted | Complete allow-list for configured and requested scopes. Every default scope must be allowed. |
+| `spec.requiredIdTokenClaims` | no | `{}` | Exact string values required in the verified upstream ID token. |
 | `spec.clientAuthentication` | yes | — | Authentication policy for requests to the relay token endpoint. |
 | `spec.redirectPolicy` | yes | — | Non-empty list of explicit application redirect matchers. |
 
@@ -129,6 +132,14 @@ The token endpoint derives CORS permission without broadening redirects. A `uri`
 origin, an `origin` entry permits that origin, and a `loopback` entry permits its IP host on any
 port. The authorization-code token request must still repeat the exact redirect URI stored for the
 flow.
+
+`requiredIdTokenClaims` applies to successful authorization-code exchanges. oauthrelay verifies
+the upstream ID-token signature, issuer, audience, lifetime, subject, issued-at time, nonce when
+requested, authorized party, and access-token hash when present. Every configured claim must exist
+as a string with the exact configured value. The policy reads only signed ID-token claims; it does
+not read UserInfo. A failed policy returns `invalid_grant` without returning upstream tokens. Relay
+codes remain single-use after a failed check. Refresh grants do not evaluate this policy because an
+upstream refresh response does not always contain an ID token.
 
 ## Client authentication
 

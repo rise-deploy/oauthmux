@@ -240,6 +240,7 @@ async fn signed_userinfo(headers: HeaderMap) -> Response {
 
 async fn setup_signed_profile(
     profile: RelayProfile,
+    required_id_token_claims: HashMap<String, String>,
 ) -> (
     Router,
     SignedFixtureState,
@@ -294,10 +295,10 @@ async fn setup_signed_profile(
     let key = ResourceKey::new("profile").unwrap();
     let upstream = Arc::new(Upstream {
         key: key.clone(),
-        issuer_url: base,
-        authorization_endpoint: None,
-        token_endpoint: None,
-        jwks_uri: None,
+        issuer_url: Url::parse(&fixture.issuer).unwrap(),
+        authorization_endpoint: Some(base.join("authorize").unwrap()),
+        token_endpoint: Some(base.join("token").unwrap()),
+        jwks_uri: Some(base.join("jwks").unwrap()),
         client_id: "upstream-client".into(),
         client_secret: SecretString::new("upstream-secret"),
     });
@@ -307,6 +308,7 @@ async fn setup_signed_profile(
         client_auth: client_auth.clone(),
         scopes: vec!["openid".into(), "email".into(), "profile".into()],
         allowed_scopes: Some(vec!["openid".into(), "email".into(), "profile".into()]),
+        required_id_token_claims,
         redirect_policy: vec![RedirectMatcher::uri(redirect_uri).unwrap()],
     });
     let mut resources = ProviderSnapshot::default();
@@ -387,6 +389,7 @@ async fn setup_with_capture(
         client_auth: auth,
         scopes: vec!["openid".into(), "email".into()],
         allowed_scopes,
+        required_id_token_claims: HashMap::new(),
         redirect_policy: vec![
             RedirectMatcher::uri("https://app.example/callback").unwrap(),
             RedirectMatcher::uri("https://app.example/callback?channel=stable&next=%2Fhome")
@@ -445,6 +448,7 @@ async fn relays_sharing_an_upstream_use_one_provider_callback() {
                 client_auth: ClientAuth::Public,
                 scopes: vec!["openid".into()],
                 allowed_scopes: None,
+                required_id_token_claims: HashMap::new(),
                 redirect_policy: vec![
                     RedirectMatcher::uri("https://app.example/callback").unwrap(),
                 ],
@@ -704,6 +708,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
         issued_at: unix_now() - CODE_TTL - 1,
         redirect_uri: "https://app.example/callback".into(),
         client_code_challenge: Some(pkce_challenge("verifier")),
+        id_token_nonce: None,
         upstream_response: StoredResponse {
             status: 200,
             content_type: None,
@@ -732,6 +737,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
         upstream_pkce_verifier: "upstream-verifier".into(),
         client_code_challenge: Some(pkce_challenge("verifier")),
         client_code_challenge_method: Some("S256".into()),
+        id_token_nonce: None,
         issued_at: unix_now() - FLOW_TTL - 1,
         nonce: [4; 16],
     };
@@ -758,6 +764,7 @@ async fn expired_code_and_invalid_redirect_are_rejected() {
         upstream_pkce_verifier: "upstream-verifier".into(),
         client_code_challenge: Some(pkce_challenge("verifier")),
         client_code_challenge_method: Some("S256".into()),
+        id_token_nonce: None,
         issued_at: unix_now(),
         nonce: [5; 16],
     };
@@ -988,8 +995,119 @@ fn validate_fixture_id_token(
     Ok(claims)
 }
 
+async fn signed_authorization_code(app: &Router, redirect_uri: &str) -> (String, String) {
+    let verifier = "required-claims-verifier-with-at-least-forty-three-characters".to_owned();
+    let mut authorize = Url::parse("https://relay.example/relay/profile/authorize").unwrap();
+    authorize
+        .query_pairs_mut()
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("state", "required-claims-state")
+        .append_pair("scope", "openid email profile")
+        .append_pair("nonce", "required-claims-nonce")
+        .append_pair("code_challenge", &pkce_challenge(&verifier))
+        .append_pair("code_challenge_method", "S256");
+    let relay_authorize = app
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "{}?{}",
+                authorize.path(),
+                authorize.query().unwrap()
+            ))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let upstream = client
+        .get(
+            relay_authorize.headers()[header::LOCATION]
+                .to_str()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let callback = Url::parse(upstream.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let relay_callback = app
+        .clone()
+        .oneshot(
+            Request::get(format!("{}?{}", callback.path(), callback.query().unwrap()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let application =
+        Url::parse(relay_callback.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let code = application
+        .query_pairs()
+        .find(|(name, _)| name == "code")
+        .unwrap()
+        .1
+        .into_owned();
+    (code, verifier)
+}
+
+#[tokio::test]
+async fn required_id_token_claims_accept_exact_strings_and_reject_missing_or_mismatched_claims() {
+    for (required, accepted) in [
+        (HashMap::from([("hd".into(), "example.com".into())]), true),
+        (
+            HashMap::from([("department".into(), "engineering".into())]),
+            false,
+        ),
+        (
+            HashMap::from([("hd".into(), "other.example".into())]),
+            false,
+        ),
+    ] {
+        let (app, _, task, redirect_uri, _) =
+            setup_signed_profile(RelayProfile::Google, required).await;
+        let (code, verifier) = signed_authorization_code(&app, &redirect_uri).await;
+        let form = serde_urlencoded::to_string([
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("code_verifier", verifier.as_str()),
+        ])
+        .unwrap();
+        let response = post_token(&app, "profile", &form).await;
+
+        if accepted {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+            assert!(body.get("id_token").is_some());
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            assert_eq!(response.headers()[header::PRAGMA], "no-cache");
+            let body: Value = serde_json::from_slice(&response_body(response).await).unwrap();
+            assert_eq!(body["error"], "invalid_grant");
+            assert_eq!(
+                body["error_description"],
+                "Identity does not satisfy required ID-token claims."
+            );
+            assert!(!body.to_string().contains("department"));
+            assert!(!body.to_string().contains("other.example"));
+
+            let replay = post_token(&app, "profile", &form).await;
+            assert_eq!(replay.status(), StatusCode::BAD_REQUEST);
+            let replay_body: Value = serde_json::from_slice(&response_body(replay).await).unwrap();
+            assert_eq!(replay_body["error"], "invalid_grant");
+            assert_eq!(replay_body["error_description"], "code was already used");
+        }
+        task.abort();
+    }
+}
+
 async fn run_signed_relay_profile(profile: RelayProfile) {
-    let (app, fixture, task, redirect_uri, client_auth) = setup_signed_profile(profile).await;
+    let (app, fixture, task, redirect_uri, client_auth) =
+        setup_signed_profile(profile, HashMap::new()).await;
     let nonce = "relying-party-nonce";
     let verifier = "profile-verifier-with-at-least-forty-three-characters";
     let mut authorize = Url::parse("https://relay.example/relay/profile/authorize").unwrap();
